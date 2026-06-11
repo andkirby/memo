@@ -269,26 +269,15 @@ fn run_tui() -> Result<()> {
                     KeyCode::Up | KeyCode::Char('k') => app.prev_group(),
                     KeyCode::Down | KeyCode::Char('j') => app.next_group(),
                     KeyCode::Enter => app.toggle_expand(),
-                    KeyCode::Char(' ') => {
-                        if app.expanded_group.is_some() {
-                            app.next_proc();
-                        }
-                    }
-                    KeyCode::Backspace => {
-                        if app.expanded_group.is_some() {
-                            app.prev_proc();
-                        }
-                    }
                     KeyCode::Char('d') => {
                         // Open detail for selected
-                        let target = if let Some(gi) = app.expanded_group {
-                            if let Some(pi) = app.proc_state.selected() {
-                                app.groups.get(gi).and_then(|g| g.processes.get(pi))
-                            } else { None }
-                        } else {
-                            app.group_state.selected().and_then(|i| app.groups.get(i))
-                                .map(|g| g.processes.first()).flatten()
-                        };
+                        let target = if let Some((gi, pi)) = app.selected_process() {
+                            if let Some(pidx) = pi {
+                                app.groups.get(gi).and_then(|g| g.processes.get(pidx))
+                            } else {
+                                app.groups.get(gi).and_then(|g| g.processes.first())
+                            }
+                        } else { None };
 
                         if let Some(proc) = target {
                             let pid = proc.pid;

@@ -2,6 +2,16 @@ use crate::group::AppGroup;
 use crate::scanner::{ProcessMemory, SystemMemory};
 use ratatui::widgets::TableState;
 
+/// Maps a visual table row index to (group_index, Some(proc_index) or None for group header)
+#[derive(Default)]
+pub struct RowMap {
+    pub entries: Vec<(usize, Option<usize>)>,
+}
+
+impl RowMap {
+    pub fn new() -> Self { Self::default() }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum SortColumn {
     Name,
@@ -30,6 +40,7 @@ pub struct App {
     pub group_state: TableState,
     pub proc_state: TableState,
     pub expanded_group: Option<usize>,
+    pub row_map: RowMap,  // visual row index → (group_idx, proc_idx)
     pub sort_column: SortColumn,
     pub sort_desc: bool,
 
@@ -73,6 +84,7 @@ impl App {
             group_state: TableState::default(),
             proc_state: TableState::default(),
             expanded_group: None,
+            row_map: RowMap::new(),
             sort_column: SortColumn::Total,
             sort_desc: true,
             is_loading: false,
@@ -98,62 +110,61 @@ impl App {
     }
 
     pub fn next_group(&mut self) {
-        let len = self.groups.len();
+        let len = self.row_map.entries.len();
         if len == 0 { return; }
         let i = match self.group_state.selected() {
             Some(i) => (i + 1) % len,
             None => 0,
         };
         self.group_state.select(Some(i));
+        self.sync_from_visual(i);
     }
 
     pub fn prev_group(&mut self) {
-        let len = self.groups.len();
+        let len = self.row_map.entries.len();
         if len == 0 { return; }
         let i = match self.group_state.selected() {
             Some(i) => if i == 0 { len - 1 } else { i - 1 },
             None => 0,
         };
         self.group_state.select(Some(i));
+        self.sync_from_visual(i);
+    }
+
+    /// Sync expanded_group and proc_state from the visual row index
+    fn sync_from_visual(&mut self, visual_idx: usize) {
+        if let Some((gi, pi)) = self.row_map.entries.get(visual_idx) {
+            let gi = *gi;
+            match pi {
+                Some(pidx) => {
+                    // We're on a sub-process row — expand its group if not already
+                    if self.expanded_group != Some(gi) {
+                        self.expanded_group = Some(gi);
+                    }
+                    self.proc_state.select(Some(*pidx));
+                }
+                None => {
+                    // We're on a group header row — no sub-process selected
+                    self.proc_state.select(None);
+                }
+            }
+        }
+    }
+
+    /// Get the currently selected process (either a sub-process or the group's first process)
+    pub fn selected_process(&self) -> Option<(usize, Option<usize>)> {
+        let visual_idx = self.group_state.selected()?;
+        self.row_map.entries.get(visual_idx).copied()
     }
 
     pub fn toggle_expand(&mut self) {
-        if let Some(i) = self.group_state.selected() {
-            if self.expanded_group == Some(i) {
+        if let Some((gi, _pi)) = self.selected_process() {
+            if self.expanded_group == Some(gi) {
                 self.expanded_group = None;
+                self.proc_state.select(None);
             } else {
-                self.expanded_group = Some(i);
+                self.expanded_group = Some(gi);
                 self.proc_state.select(Some(0));
-            }
-        }
-    }
-
-    pub fn next_proc(&mut self) {
-        if self.expanded_group.is_none() { return; }
-        if let Some(gi) = self.expanded_group {
-            if let Some(g) = self.groups.get(gi) {
-                let len = g.processes.len();
-                if len == 0 { return; }
-                let i = match self.proc_state.selected() {
-                    Some(i) => (i + 1) % len,
-                    None => 0,
-                };
-                self.proc_state.select(Some(i));
-            }
-        }
-    }
-
-    pub fn prev_proc(&mut self) {
-        if self.expanded_group.is_none() { return; }
-        if let Some(gi) = self.expanded_group {
-            if let Some(g) = self.groups.get(gi) {
-                let len = g.processes.len();
-                if len == 0 { return; }
-                let i = match self.proc_state.selected() {
-                    Some(i) => if i == 0 { len - 1 } else { i - 1 },
-                    None => 0,
-                };
-                self.proc_state.select(Some(i));
             }
         }
     }
@@ -223,15 +234,15 @@ impl App {
     }
 
     pub fn kill_selected(&mut self) {
-        let pid = if let Some(gi) = self.expanded_group {
-            // Kill selected sub-process
-            if let Some(pi) = self.proc_state.selected() {
-                self.groups.get(gi).and_then(|g| g.processes.get(pi)).map(|p| p.pid)
-            } else { None }
-        } else {
-            // Kill main process of selected group
-            self.group_state.selected().and_then(|i| self.groups.get(i)).map(|g| g.processes.first().map(|p| p.pid)).flatten()
-        };
+        let pid = if let Some((gi, pi)) = self.selected_process() {
+            if let Some(pidx) = pi {
+                // Kill specific sub-process
+                self.groups.get(gi).and_then(|g| g.processes.get(pidx)).map(|p| p.pid)
+            } else {
+                // Kill first (main) process of group
+                self.groups.get(gi).and_then(|g| g.processes.first()).map(|p| p.pid)
+            }
+        } else { None };
 
         if let Some(pid) = pid {
             let _ = std::process::Command::new("kill").arg("-9").arg(pid.to_string()).output();

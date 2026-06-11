@@ -130,6 +130,7 @@ fn render_process_table(f: &mut Frame, app: &mut App, area: Rect) {
     let expanded = app.expanded_group;
 
     let mut rows: Vec<Row> = Vec::new();
+    let mut row_map: Vec<(usize, Option<usize>)> = Vec::new();
     for (gi, group) in app.groups.iter().enumerate() {
         let is_expanded = expanded == Some(gi);
         let prefix = if is_expanded { "▾ " } else { "▸ " };
@@ -151,10 +152,11 @@ fn render_process_table(f: &mut Frame, app: &mut App, area: Rect) {
         ]).height(1);
 
         rows.push(row);
+        row_map.push((gi, None));  // group header row
 
         // If expanded, show child processes
         if is_expanded {
-            for proc in &group.processes {
+            for (pi, proc) in group.processes.iter().enumerate() {
                 let child_row = Row::new(vec![
                     Cell::from(format!("    PID {}", proc.pid)).style(Style::default().fg(Color::DarkGray)),
                     Cell::from(""),
@@ -164,9 +166,13 @@ fn render_process_table(f: &mut Frame, app: &mut App, area: Rect) {
                     Cell::from(proc.threads.to_string()).style(Style::default().fg(Color::DarkGray)),
                 ]).height(1);
                 rows.push(child_row);
+                row_map.push((gi, Some(pi)));  // sub-process row
             }
         }
     }
+
+    // Store the row map so main.rs can use it for navigation
+    app.row_map.entries = row_map;
 
     let widths = [
         Constraint::Percentage(30),
