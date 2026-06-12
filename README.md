@@ -2,6 +2,8 @@
 
 A terminal tool that shows **which apps consume your RAM and swap**, grouping multi-process applications into a single entry. 100 Chrome processes? One row.
 
+<img width="896" height="287" alt="image" src="https://github.com/user-attachments/assets/0ace5bf9-e729-43dd-afcd-16901e280df3" />
+
 ```
 APP                            PROCS   RSS          SWAP         TOTAL
 ────────────────────────────────────────────────────────────────────────
