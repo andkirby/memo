@@ -23,33 +23,24 @@ struct FootprintProcess {
 }
 
 #[derive(Debug, Deserialize)]
-struct FootprintAuxiliary {
-    phys_footprint: u64,
-}
+struct FootprintAuxiliary { #[allow(dead_code)] phys_footprint: u64 }
 
 #[derive(Debug, Deserialize)]
-struct FootprintCategory {
-    #[serde(default)]
-    swapped: u64,
-}
+struct FootprintCategory { #[allow(dead_code)] swapped: u64 }
 
+/// Swap data extracted from `footprint` for a single process.
 #[derive(Debug, Clone)]
-pub struct FootprintData {
-    #[allow(dead_code)]
-    pub pid: i32,
-    #[allow(dead_code)]
-    pub name: String,
-    pub physical_footprint: u64,
+pub struct SwapData {
     pub swapped_total: u64,
 }
 
-pub fn get_footprint_for_pids(pids: &[i32]) -> Result<HashMap<i32, FootprintData>> {
+/// Run `footprint` on a batch of PIDs and extract per-process swap data.
+pub fn get_swap_for_pids(pids: &[i32]) -> Result<HashMap<i32, SwapData>> {
     if pids.is_empty() {
         return Ok(HashMap::new());
     }
 
-    let tmp_path =
-        std::env::temp_dir().join(format!("memo_footprint_{}.json", Uuid::new_v4()));
+    let tmp_path = std::env::temp_dir().join(format!("memo_footprint_{}.json", Uuid::new_v4()));
 
     let mut cmd = Command::new("footprint");
     cmd.arg("-j").arg(&tmp_path);
@@ -64,9 +55,7 @@ pub fn get_footprint_for_pids(pids: &[i32]) -> Result<HashMap<i32, FootprintData
         .context("Failed to execute footprint")?;
 
     if !status.success() {
-        if tmp_path.exists() {
-            let _ = fs::remove_file(&tmp_path);
-        }
+        let _ = fs::remove_file(&tmp_path);
         return Err(anyhow::anyhow!("footprint command failed"));
     }
 
@@ -78,22 +67,8 @@ pub fn get_footprint_for_pids(pids: &[i32]) -> Result<HashMap<i32, FootprintData
 
     let mut map = HashMap::new();
     for p in output.processes {
-        let phys = p
-            .auxiliary
-            .as_ref()
-            .map(|a| a.phys_footprint)
-            .unwrap_or(p.footprint);
         let swapped = p.categories.values().map(|c| c.swapped).sum();
-
-        map.insert(
-            p.pid,
-            FootprintData {
-                pid: p.pid,
-                name: p.name,
-                physical_footprint: phys,
-                swapped_total: swapped,
-            },
-        );
+        map.insert(p.pid, SwapData { swapped_total: swapped });
     }
 
     Ok(map)
