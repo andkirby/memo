@@ -169,6 +169,7 @@ fn run_tui() -> Result<()> {
 
     let tick_rate = Duration::from_millis(100);
     let mut last_tick = Instant::now();
+    let mut last_click: Option<(u16, u16, Instant)> = None; // (row, col, time) for double-click
 
     loop {
         terminal.draw(|f| ui::ui(f, &mut app))?;
@@ -181,7 +182,27 @@ fn run_tui() -> Result<()> {
                     MouseEventKind::ScrollUp => app.scroll_table(true),
                     MouseEventKind::ScrollDown => app.scroll_table(false),
                     MouseEventKind::Down(crossterm::event::MouseButton::Left) => {
-                        app.click_table(mouse.row, mouse.column);
+                        // Detect double-click (same row within 400ms)
+                        let now = Instant::now();
+                        let is_double = last_click.map_or(false, |(r, _c, t)| {
+                            r == mouse.row && now.duration_since(t) < Duration::from_millis(400)
+                        });
+                        last_click = Some((mouse.row, mouse.column, now));
+
+                        if is_double {
+                            // Double-click on sub-process = open detail
+                            if let Some((_gi, pi)) = app.selected_process() {
+                                if pi.is_some() {
+                                    app.detail_view_open = true;
+                                    app.current_detail = None;
+                                    show_detail(&app, &tx);
+                                } else {
+                                    app.toggle_expand();
+                                }
+                            }
+                        } else {
+                            app.click_table(mouse.row, mouse.column);
+                        }
                     }
                     MouseEventKind::Down(crossterm::event::MouseButton::Right) => app.toggle_expand(),
                     _ => {}
@@ -197,8 +218,26 @@ fn run_tui() -> Result<()> {
                             KeyCode::Char('q') => app.quit(),
                             KeyCode::Up | KeyCode::Char('k') => app.prev_group(),
                             KeyCode::Down | KeyCode::Char('j') => app.next_group(),
-                            KeyCode::Enter => app.toggle_expand(),
-                            KeyCode::Char('d') => show_detail(&app, &tx),
+                            KeyCode::Enter => {
+                                // If on a leaf process (expanded group sub-row), open detail
+                                // If on a group header, toggle expand
+                                if let Some((gi, pi)) = app.selected_process() {
+                                    if pi.is_some() {
+                                        // On a sub-process — open detail
+                                        app.detail_view_open = true;
+                                        app.current_detail = None;
+                                        show_detail(&app, &tx);
+                                    } else {
+                                        // On a group header — toggle expand
+                                        app.toggle_expand();
+                                    }
+                                }
+                            }
+                            KeyCode::Char('d') => {
+                                app.detail_view_open = true;
+                                app.current_detail = None;
+                                show_detail(&app, &tx);
+                            }
                             KeyCode::Char('r') => {
                                 if !app.is_loading {
                                     app.is_loading = true;
