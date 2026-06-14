@@ -30,12 +30,34 @@ instrumentation) and merges all runtimes of a project into a single row.
 
 ## Install
 
+**Option A — prebuilt binary (recommended)**
+
+Download from [releases](https://github.com/andkirby/memo/releases), or one-liner:
+
+```bash
+# Pick the slice for your Mac, then drop it on your PATH.
+arch=$(uname -m)
+case "$arch" in
+  arm64)  asset=memo-macos-arm64  ;;   # Apple Silicon (M1/M2/M3…)
+  x86_64) asset=memo-macos-x86_64 ;;   # Intel
+  *) echo "unsupported arch: $arch" >&2; exit 1 ;;
+esac
+curl -L "https://github.com/andkirby/memo/releases/latest/download/$asset" \
+  -o /usr/local/bin/memo && chmod +x /usr/local/bin/memo
+```
+
+**Option B — build from source**
+
 ```bash
 cargo build --release
-cp target/release/memo ~/bin/memo   # or /usr/local/bin/memo
-# On Apple Silicon, a freshly copied binary is killed on exec (com.apple.provenance).
-# Clear the xattr and re-sign ad-hoc:
-xattr -cr ~/bin/memo && codesign --force -s - ~/bin/memo
+cp target/release/memo /usr/local/bin/memo   # or ~/bin/memo
+```
+
+**Required on macOS either way** — a freshly downloaded/built binary is killed
+on exec (`com.apple.provenance`). Clear the xattr and re-sign ad-hoc:
+
+```bash
+xattr -cr /usr/local/bin/memo && codesign --force -s - /usr/local/bin/memo
 ```
 
 Requires macOS with Xcode command line tools (`footprint` and `lsof` must be available).
