@@ -164,7 +164,10 @@ The per-process "RSS" column matches what `ps aux` and Activity Monitor show. Th
 
 ## Known limitations
 
-- **macOS only** — depends on `footprint`, `vm_stat`, `sysctl`
+- **macOS only** — no Linux/Windows support, and not planned. Depends on `footprint`, `vm_stat`, `sysctl`, and `lsof`.
+- **Build targets: `aarch64-apple-darwin` (Apple Silicon) and `x86_64-apple-darwin` (Intel).** No universal binary — grab the slice matching your CPU.
+- **Tested on macOS Sonoma (14) only.** Expected to run on macOS 11 Big Sur and later (the arm64 slice requires Apple Silicon, i.e. 11+ anyway). The Intel slice is **cross-compiled in CI and not run-tested on Intel hardware** — it should work, but treat it as best-effort.
+- **Intel is end-of-life.** macOS 26 Tahoe (Sept 2025) is the last release supporting Intel Macs; its successor (Golden Gate, fall 2026) is Apple-Silicon-only. The `memo-macos-x86_64` build targets that shrinking tail.
 - **Compressed memory gap** — Activity Monitor shows more compressed memory than our `vm_stat` reading. This is because AM uses private `host_statistics64()` API.
 - **Swap unaccounted** — processes with RSS < 5 MB are skipped during deep scan. Their swap contribution is shown as "unaccounted" in CLI mode. This is a deliberate speed/accuracy tradeoff.
 - **Shared memory not deducted** — if two processes share 100 MB of memory, each shows 100 MB RSS. The "total if killed" is approximate. This is a fundamental limitation of per-process accounting.
