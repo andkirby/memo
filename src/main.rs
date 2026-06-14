@@ -14,7 +14,7 @@ use std::{
 };
 
 use anyhow::Result;
-use app::{App, ProcessDetail, SortColumn, ViewMode};
+use app::{App, ProcessDetail, SortColumn};
 use clap::Parser;
 use crossterm::{
     event::{self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, MouseEvent, MouseEventKind},
@@ -39,6 +39,10 @@ struct Args {
     /// Sort: total, rss, swap, name
     #[arg(long, default_value = "total")]
     sort: String,
+
+    /// Group mode for --cli: app, project
+    #[arg(long, default_value = "app")]
+    group: String,
 }
 
 // ─── Scan events (background → main thread) ────────────────────────────────
@@ -126,23 +130,31 @@ fn run_cli(args: Args) -> Result<()> {
                 p.pid, truncate(&p.name, 35), format_size(p.rss), format_size(p.swap), format_size(p.total()))?;
         }
     } else {
-        let groups = group::group_processes(&processes);
+        let mode = match args.group.as_str() {
+            "project" => group::GroupMode::Project,
+            _ => group::GroupMode::App,
+        };
+        let groups = group::group_processes(&processes, mode);
         let total_procs: usize = groups.iter().map(|g| g.processes.len()).sum();
+        let (noun, noun_pl) = match mode {
+            group::GroupMode::Project => ("PROJECT", "projects"),
+            group::GroupMode::App => ("APP", "apps"),
+        };
 
-        writeln!(out, "{:<30} {:<7} {:<12} {:<12} {:<12}",
-            "APP", "PROCS", "RSS", "SWAP", "TOTAL")?;
-        writeln!(out, "{}", "─".repeat(80))?;
+        writeln!(out, "{:<30} {:<7} {:<24} {:<12} {:<12} {:<12}",
+            noun, "PROCS", "BREAKDOWN", "RSS", "SWAP", "TOTAL")?;
+        writeln!(out, "{}", "─".repeat(100))?;
         for g in &groups {
-            writeln!(out, "{:<30} {:<7} {:<12} {:<12} {:<12}",
-                truncate(&g.name, 30), g.processes.len(),
+            writeln!(out, "{:<30} {:<7} {:<24} {:<12} {:<12} {:<12}",
+                truncate(&g.name, 30), g.processes.len(), truncate(&g.bridge(mode), 24),
                 format_size(g.total_rss), format_size(g.total_swap), format_size(g.total()))?;
         }
 
         writeln!(out)?;
         let sum_swap: u64 = processes.iter().map(|p| p.swap).sum();
         let delta = sys_mem.swap_used.saturating_sub(sum_swap);
-        writeln!(out, "{} apps • {} processes • {} rss • {} swap (system: {})",
-            groups.len(), total_procs,
+        writeln!(out, "{} {} • {} processes • {} rss • {} swap (system: {})",
+            groups.len(), noun_pl, total_procs,
             format_size(processes.iter().map(|p| p.rss).sum::<u64>()),
             format_size(sum_swap), format_size(sys_mem.swap_used))?;
         if delta > 100 * 1024 * 1024 {
@@ -253,10 +265,7 @@ fn run_tui() -> Result<()> {
                             KeyCode::Char('p') => { app.sort_column = SortColumn::Physical; app.sort_desc = true; app.sort_groups(); }
                             KeyCode::Char('s') => { app.sort_column = SortColumn::Swap; app.sort_desc = true; app.sort_groups(); }
                             KeyCode::Char('n') => { app.sort_column = SortColumn::Name; app.sort_desc = false; app.sort_groups(); }
-                            KeyCode::Tab => app.view_mode = match app.view_mode {
-                                ViewMode::Overview => ViewMode::Ps,
-                                ViewMode::Ps => ViewMode::Overview,
-                            },
+                            KeyCode::Tab => app.cycle_group(),
                             _ => {}
                         }
                     }
@@ -430,14 +439,18 @@ fn perform_scan(tx: mpsc::Sender<ScanEvent>) {
 fn collect_processes() -> Vec<ProcessMemory> {
     let mut sys = System::new_all();
     sys.refresh_all();
+    let cwd_map = scanner::bulk_cwd_map();
 
     sys.processes().iter().map(|(pid, proc)| {
+        let pid_i = pid.as_u32() as i32;
         let mut p = ProcessMemory::new(
-            pid.as_u32() as i32,
+            pid_i,
             proc.name().to_string_lossy().to_string(),
             proc.memory(),
         );
         p.cmdline = proc.cmd().iter().map(|s| s.to_string_lossy().to_string()).collect::<Vec<_>>().join(" ");
+        p.cwd = proc.cwd().map(|c| c.to_string_lossy().to_string())
+            .unwrap_or_else(|| cwd_map.get(&pid_i).cloned().unwrap_or_default());
         p.threads = 1; // sysinfo 0.33 doesn't expose threads
         p
     }).collect()

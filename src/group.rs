@@ -1,11 +1,29 @@
 use crate::scanner::ProcessMemory;
 use std::collections::HashMap;
+use std::path::PathBuf;
 
-/// A group of processes belonging to the same "app".
-/// e.g. all "Google Chrome Helper (Renderer)" + "Google Chrome" → one Chrome group.
+// ─── Grouping mode (see ADR 0001) ──────────────────────────────────────────
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GroupMode {
+    /// Group by canonical app name (Chrome, Slack, node, …) — the legacy view.
+    App,
+    /// Group by project directory (cwd marker walkup). Processes with no
+    /// project fall back to app-name grouping (hybrid). TUI default.
+    Project,
+}
+
+/// Whether a group was keyed by a project path or by an app name.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GroupKind {
+    App,
+    Project,
+}
+
 #[derive(Debug, Clone)]
 pub struct AppGroup {
     pub name: String,
+    pub kind: GroupKind,
     pub processes: Vec<ProcessMemory>,
     pub total_rss: u64,
     pub total_swap: u64,
@@ -22,9 +40,55 @@ impl AppGroup {
         self.total_swap = self.processes.iter().map(|p| p.swap).sum();
         self.thread_count = self.processes.iter().map(|p| p.threads).sum();
     }
+
+    /// The bridge column — the *other* view's key, so switching views loses no
+    /// information. Public entrypoint uses $HOME.
+    pub fn bridge(&self, mode: GroupMode) -> String {
+        self.bridge_in(mode, &home_dir())
+    }
+
+    fn bridge_in(&self, mode: GroupMode, home: &str) -> String {
+        match (mode, self.kind) {
+            // Project group → runtime breakdown, e.g. "node:15 bun:3"
+            (GroupMode::Project, GroupKind::Project) => {
+                let mut counts: Vec<(String, usize)> = {
+                    let mut m: HashMap<String, usize> = HashMap::new();
+                    for p in &self.processes {
+                        *m.entry(runtime_family(&p.name)).or_insert(0) += 1;
+                    }
+                    m.into_iter().collect()
+                };
+                counts.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+                counts.iter()
+                    .map(|(f, c)| format!("{}:{}", f, c))
+                    .collect::<Vec<_>>()
+                    .join(" ")
+            }
+            // App group (in either mode) → distinct projects under that app
+            (GroupMode::App, GroupKind::App) => {
+                let mut projs: Vec<String> = Vec::new();
+                for p in &self.processes {
+                    if let Some(r) = project_root_in(&p.cwd, &p.cmdline, home) {
+                        let s = shorten_in(&r, home);
+                        if !projs.contains(&s) {
+                            projs.push(s);
+                        }
+                    }
+                }
+                match projs.len() {
+                    0 => String::new(),
+                    1 => projs[0].clone(),
+                    n => format!("{} projects", n),
+                }
+            }
+            // App-fallback group inside Project mode, or any other combo: none.
+            _ => String::new(),
+        }
+    }
 }
 
-/// Normalise a process name into a canonical "app" name.
+// ─── App-name canonicalisation ─────────────────────────────────────────────
+
 fn canonical_app_name(name: &str, cmdline: &str) -> String {
     let n = name.to_lowercase();
 
@@ -67,84 +131,140 @@ fn canonical_app_name(name: &str, cmdline: &str) -> String {
     if n.contains("zoom") { return "Zoom".into(); }
     if n.contains("spotify") { return "Spotify".into(); }
 
-    // Node / bun / deno — identify by project
-    if n == "node" || n == "bun" || n == "deno" {
-        if let Some(proj) = extract_project(cmdline) {
-            return format!("{} ({})", name, proj);
-        }
-        return name.to_string();
-    }
-
-    // Python — identify by project or module
-    if n == "python" || n.starts_with("python3") || n == "python3.10" || n == "python3.11" || n == "python3.12" {
-        if let Some(proj) = extract_python_module(cmdline) {
-            return format!("Python ({})", proj);
-        }
-        return "Python".into();
-    }
+    // Dev runtimes: one row per runtime. The bridge column carries projects.
+    if n == "node" || n == "node-repl" { return "node".into(); }
+    if n == "bun" { return "bun".into(); }
+    if n == "deno" { return "deno".into(); }
+    if n == "python" || n == "python2" || n.starts_with("python3") { return "Python".into(); }
 
     name.to_string()
 }
 
-fn extract_project(cmdline: &str) -> Option<String> {
-    let parts: Vec<&str> = cmdline.split_whitespace().collect();
-    for part in parts.iter().rev() {
-        if part.starts_with('/') || part.starts_with("~/") || part.starts_with("./") {
-            if let Some(name) = part.split('/').last() {
-                let name = name.trim_end_matches('/');
-                if !name.is_empty() && name != "." && name != ".." {
-                    return Some(name.to_string());
+// ─── Project resolution: cwd → nearest marker ──────────────────────────────
+
+const MARKERS: &[&str] = &[
+    ".git", "package.json", "pyproject.toml", "bun.lockb", "bun.lock",
+    "Cargo.toml", "go.mod", "pom.xml", "Makefile", "composer.json",
+];
+
+/// Paths under home that are NOT projects (editor/CLI internals). Home-relative.
+const EXCLUDE_SUFFIXES: &[&str] = &[
+    "/Library", "/.cache", "/.local", "/.bun/install", "/.npm",
+    "/.cargo", "/.config", "/.rustup", "/.volta", "/.nvm",
+];
+
+fn home_dir() -> String {
+    std::env::var("HOME").unwrap_or_default()
+}
+
+fn excluded_in(path: &str, home: &str) -> bool {
+    for suf in EXCLUDE_SUFFIXES {
+        if path.starts_with(&format!("{}{}", home, suf)) {
+            return true;
+        }
+    }
+    false
+}
+
+/// Walk up from `dir` to the nearest project marker. Only considers paths under
+/// `home`; excludes editor/CLI internals. None if no marker found.
+fn find_marker_up_in(dir: &str, home: &str) -> Option<String> {
+    if dir.is_empty() || !dir.starts_with('/') { return None; }
+    if excluded_in(dir, home) { return None; }
+    let home_prefix = format!("{}/", home);
+    if dir != home && !dir.starts_with(&home_prefix) { return None; }
+
+    let mut d = PathBuf::from(dir);
+    loop {
+        for m in MARKERS {
+            if d.join(m).exists() {
+                return Some(d.to_string_lossy().to_string());
+            }
+        }
+        if !d.pop() { break; }
+        if d == PathBuf::from(home) {
+            // Check home itself once, then stop — never walk above $HOME.
+            for m in MARKERS {
+                if d.join(m).exists() {
+                    return Some(d.to_string_lossy().to_string());
                 }
             }
+            break;
         }
     }
     None
 }
 
-/// Extract a recognizable module name from python command line
-fn extract_python_module(cmdline: &str) -> Option<String> {
-    let parts: Vec<&str> = cmdline.split_whitespace().collect();
-    for (i, part) in parts.iter().enumerate() {
-        if part.ends_with("/python3") || part.ends_with("/python") || part.ends_with("/python3.10")
-            || part.ends_with("/python3.11") || part.ends_with("/python3.12") {
-            // Look for -m module or the script name after python
-            if let Some(next) = parts.get(i + 1) {
-                if *next == "-m" {
-                    if let Some(mod_name) = parts.get(i + 2) {
-                        return Some(mod_name.to_string());
-                    }
-                } else if next == &"-u" {
-                    if let Some(mod_name) = parts.get(i + 2) {
-                        // Could be a script path or module
-                        return Some(mod_name.split('/').last().unwrap_or(mod_name).to_string());
-                    }
-                } else if !next.starts_with('-') {
-                    return Some(next.split('/').last().unwrap_or(next).to_string());
-                }
-            }
-        }
-        // uvicorn is a common python server
-        if part.contains("uvicorn") {
-            return Some("uvicorn".to_string());
+/// Resolve a project root: prefer cwd, fall back to the first home-relative
+/// path in cmdline. None if the process isn't under a project.
+fn project_root_in(cwd: &str, cmdline: &str, home: &str) -> Option<String> {
+    if let Some(r) = find_marker_up_in(cwd, home) { return Some(r); }
+    let home_prefix = format!("{}/", home);
+    for tok in cmdline.split_whitespace() {
+        if tok.starts_with(&home_prefix) {
+            if let Some(r) = find_marker_up_in(tok, home) { return Some(r); }
         }
     }
-    extract_project(cmdline)
+    None
 }
 
-/// Group a flat list of processes into AppGroups, sorted by total memory descending.
-pub fn group_processes(processes: &[ProcessMemory]) -> Vec<AppGroup> {
-    let mut groups: HashMap<String, Vec<ProcessMemory>> = HashMap::new();
+/// Map a process name to a runtime family label for the bridge column.
+fn runtime_family(name: &str) -> String {
+    let n = name.trim_start_matches('-').to_lowercase();
+    if matches!(n.as_str(), "node" | "node-repl" | "npm" | "npx" | "yarn" | "pnpm") {
+        return "node".into();
+    }
+    if n == "bun" { return "bun".into(); }
+    if n == "deno" { return "deno".into(); }
+    if n == "python" || n == "python2" || n.starts_with("python3") || n == "uv" || n == "poetry" {
+        return "python".into();
+    }
+    if matches!(n.as_str(), "ruby" | "rails" | "bundle" | "rake") {
+        return "ruby".into();
+    }
+    if n == "go" { return "go".into(); }
+    n
+}
+
+fn shorten_in(path: &str, home: &str) -> String {
+    if path == home { return "~".into(); }
+    if let Some(rest) = path.strip_prefix(&format!("{}/", home)) {
+        return format!("~/{}", rest);
+    }
+    path.to_string()
+}
+
+// ─── Grouping ──────────────────────────────────────────────────────────────
+
+/// Group processes by `mode`, sorted by total memory (rss + swap) descending.
+/// Grouping is a pure function of the process list — no hidden state.
+pub fn group_processes(processes: &[ProcessMemory], mode: GroupMode) -> Vec<AppGroup> {
+    group_processes_in(processes, mode, &home_dir())
+}
+
+fn group_processes_in(processes: &[ProcessMemory], mode: GroupMode, home: &str) -> Vec<AppGroup> {
+    let mut buckets: HashMap<String, (GroupKind, Vec<ProcessMemory>)> = HashMap::new();
 
     for p in processes {
-        let app_name = canonical_app_name(&p.name, &p.cmdline);
-        groups.entry(app_name).or_default().push(p.clone());
+        let (kind, key) = match mode {
+            GroupMode::Project => match project_root_in(&p.cwd, &p.cmdline, home) {
+                Some(root) => (GroupKind::Project, root),
+                None => (GroupKind::App, canonical_app_name(&p.name, &p.cmdline)),
+            },
+            GroupMode::App => (GroupKind::App, canonical_app_name(&p.name, &p.cmdline)),
+        };
+        buckets.entry(key).or_insert_with(|| (kind, Vec::new())).1.push(p.clone());
     }
 
-    let mut result: Vec<AppGroup> = groups
+    let mut result: Vec<AppGroup> = buckets
         .into_iter()
-        .map(|(name, mut procs)| {
+        .map(|(key, (kind, mut procs))| {
             procs.sort_by(|a, b| b.rss.cmp(&a.rss));
-            let mut g = AppGroup { name, processes: procs, total_rss: 0, total_swap: 0, thread_count: 0 };
+            let name = if kind == GroupKind::Project { shorten_in(&key, home) } else { key };
+            let mut g = AppGroup {
+                name, kind, processes: procs,
+                total_rss: 0, total_swap: 0, thread_count: 0,
+            };
             g.recalc();
             g
         })
@@ -157,30 +277,129 @@ pub fn group_processes(processes: &[ProcessMemory]) -> Vec<AppGroup> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::scanner::ProcessMemory;
+    use std::fs;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+
+    /// A unique temp dir used as a fake $HOME. NOT under the real $HOME, so
+    /// tests don't pollute the user's tree and don't race on the env var.
+    fn fake_home() -> String {
+        let n = COUNTER.fetch_add(1, Ordering::SeqCst);
+        let mut p = std::env::temp_dir();
+        p.push(format!("memo-test-{}/{}", std::process::id(), n));
+        fs::create_dir_all(&p).unwrap();
+        p.to_string_lossy().to_string()
+    }
 
     fn pm(pid: i32, name: &str, rss: u64) -> ProcessMemory {
         ProcessMemory::new(pid, name.into(), rss)
     }
 
-    #[test]
-    fn test_chrome_grouping() {
-        let groups = group_processes(&[
-            pm(1, "Google Chrome", 100), pm(2, "Google Chrome Helper (Renderer)", 200),
-            pm(3, "Google Chrome Helper (GPU)", 50), pm(4, "Google Chrome Helper", 30),
-        ]);
-        assert_eq!(groups.len(), 1);
-        assert_eq!(groups[0].name, "Google Chrome");
-        assert_eq!(groups[0].processes.len(), 4);
-        assert_eq!(groups[0].total_rss, 380);
+    fn pm_cwd(pid: i32, name: &str, rss: u64, cwd: &str, cmdline: &str) -> ProcessMemory {
+        ProcessMemory {
+            pid, name: name.into(), cmdline: cmdline.into(), cwd: cwd.into(),
+            rss, swap: 0, threads: 1,
+        }
     }
 
     #[test]
-    fn test_mixed_apps() {
+    fn app_mode_groups_chrome_helpers() {
         let groups = group_processes(&[
-            pm(1, "Google Chrome", 500), pm(2, "Slack", 200), pm(3, "Google Chrome Helper (Renderer)", 300),
-        ]);
-        assert_eq!(groups.len(), 2);
+            pm(1, "Google Chrome", 100),
+            pm(2, "Google Chrome Helper (Renderer)", 200),
+            pm(3, "Google Chrome Helper (GPU)", 50),
+        ], GroupMode::App);
+        assert_eq!(groups.len(), 1);
         assert_eq!(groups[0].name, "Google Chrome");
-        assert_eq!(groups[1].name, "Slack");
+        assert_eq!(groups[0].kind, GroupKind::App);
+        assert_eq!(groups[0].processes.len(), 3);
+        assert_eq!(groups[0].total_rss, 350);
+    }
+
+    #[test]
+    fn app_mode_merges_node_into_one_row() {
+        // Two node procs from different projects collapse to one "node" group;
+        // the bridge carries the per-project split.
+        let home = fake_home();
+        fs::create_dir_all(format!("{}/projA", home)).unwrap();
+        fs::create_dir_all(format!("{}/projB", home)).unwrap();
+        fs::write(format!("{}/projA/package.json", home), "{}").unwrap();
+        fs::write(format!("{}/projB/package.json", home), "{}").unwrap();
+        let groups = group_processes_in(&[
+            pm_cwd(10, "node", 300, &format!("{}/projA", home), "node vite"),
+            pm_cwd(11, "node", 200, &format!("{}/projB", home), "node vite"),
+        ], GroupMode::App, &home);
+        assert_eq!(groups.len(), 1);
+        assert_eq!(groups[0].name, "node");
+        assert_eq!(groups[0].bridge_in(GroupMode::App, &home), "2 projects");
+    }
+
+    #[test]
+    fn project_mode_merges_all_runtimes_of_one_project() {
+        let home = fake_home();
+        fs::create_dir_all(format!("{}/self-calendar", home)).unwrap();
+        fs::write(format!("{}/self-calendar/.git", home), "").unwrap();
+        let groups = group_processes_in(&[
+            pm_cwd(1, "node", 500, &format!("{}/self-calendar", home), "node vite"),
+            pm_cwd(2, "bun", 300, &format!("{}/self-calendar", home), "bun start"),
+            pm_cwd(3, "-zsh", 10, &format!("{}/self-calendar", home), "-zsh"),
+        ], GroupMode::Project, &home);
+        assert_eq!(groups.len(), 1, "all three collapse to one project group");
+        assert_eq!(groups[0].kind, GroupKind::Project);
+        assert!(groups[0].name.ends_with("self-calendar"));
+        assert_eq!(groups[0].processes.len(), 3);
+        // runtime breakdown, count-sorted then name-sorted: bun:1 node:1 zsh:1
+        assert_eq!(groups[0].bridge_in(GroupMode::Project, &home), "bun:1 node:1 zsh:1");
+    }
+
+    #[test]
+    fn project_mode_app_fallback_for_slack() {
+        let home = fake_home();
+        let groups = group_processes_in(&[
+            pm_cwd(1, "Slack Helper (Renderer)", 200, "/nonexistent", ""),
+        ], GroupMode::Project, &home);
+        assert_eq!(groups.len(), 1);
+        assert_eq!(groups[0].name, "Slack");
+        assert_eq!(groups[0].kind, GroupKind::App);
+    }
+
+    #[test]
+    fn marker_walkup_collapses_nested_subdir() {
+        let home = fake_home();
+        fs::create_dir_all(format!("{}/proj/vendor/pkg/deep", home)).unwrap();
+        fs::write(format!("{}/proj/.git", home), "").unwrap();
+        let root = find_marker_up_in(
+            &format!("{}/proj/vendor/pkg/deep", home), &home);
+        assert_eq!(root.as_deref(), Some(format!("{}/proj", home).as_str()));
+    }
+
+    #[test]
+    fn marker_walkup_excludes_editor_internals() {
+        let home = fake_home();
+        let zed = format!("{}/Library/Application Support/Zed/x", home);
+        fs::create_dir_all(&zed).unwrap();
+        fs::write(format!("{}/package.json", zed), "{}").unwrap();
+        // Even though a marker exists, the path is excluded.
+        let root = find_marker_up_in(&zed, &home);
+        assert!(root.is_none(), "editor internal paths must not become projects");
+    }
+
+    #[test]
+    fn runtime_family_maps_known_runtimes() {
+        assert_eq!(runtime_family("node"), "node");
+        assert_eq!(runtime_family("node-repl"), "node");
+        assert_eq!(runtime_family("python3.11"), "python");
+        assert_eq!(runtime_family("-zsh"), "zsh"); // login shell → family zsh
+        assert_eq!(runtime_family("vite"), "vite"); // unknown passthrough
+    }
+
+    #[test]
+    fn shorten_replaces_home_prefix() {
+        let home = "/Users/test";
+        assert_eq!(shorten_in("/Users/test/proj", home), "~/proj");
+        assert_eq!(shorten_in("/Users/test", home), "~");
+        assert_eq!(shorten_in("/opt/other", home), "/opt/other");
     }
 }

@@ -1,1 +1,23 @@
+# build artifacts
 /target
+
+# macOS
+.DS_Store
+
+# editor / IDE state
+.idea/
+.vscode/
+.zed/
+*.swp
+*.swo
+*~
+
+# secrets
+.env
+.env.*
+
+# transient tooling state
+/.ralph/
+
+# logs
+*.log

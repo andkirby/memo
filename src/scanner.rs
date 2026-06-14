@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::process::Command;
 
 // ─── Process memory — single source of truth ──────────────────────────────
@@ -14,6 +15,7 @@ pub struct ProcessMemory {
     pub pid: i32,
     pub name: String,
     pub cmdline: String,
+    pub cwd: String,    // from sysinfo (+ lsof fallback) — used for project grouping
     pub rss: u64,       // from sysinfo — honest per-process resident memory
     pub swap: u64,      // from footprint — pages swapped to disk
     pub threads: usize,
@@ -29,6 +31,7 @@ impl ProcessMemory {
             pid,
             name,
             cmdline: String::new(),
+            cwd: String::new(),
             rss,
             swap: 0,
             threads: 1,
@@ -67,6 +70,37 @@ pub fn parse_size(size_str: &str) -> u64 {
     };
     let num: f64 = num_str.parse().unwrap_or(0.0);
     (num * multiplier as f64) as u64
+}
+
+// ─── Bulk cwd (one lsof call) ───────────────────────────────────────────────
+// sysinfo usually gives cwd via proc_pidinfo; where it doesn't (some system
+// procs, or depending on refresh flags), a single `lsof -d cwd` call fills the
+// gaps for the whole process list at once (~0.14s on a ~350-proc machine).
+
+pub fn bulk_cwd_map() -> HashMap<i32, String> {
+    let mut map = HashMap::new();
+    let Ok(o) = Command::new("lsof").arg("-d").arg("cwd").arg("-Fn").output() else {
+        return map;
+    };
+    if !o.status.success() { return map; }
+
+    let text = String::from_utf8_lossy(&o.stdout);
+    let mut cur_pid: Option<i32> = None;
+    for line in text.lines() {
+        match line.chars().next() {
+            Some('p') => cur_pid = line[1..].trim().parse::<i32>().ok(),
+            Some('n') => {
+                if let Some(pid) = cur_pid {
+                    let path = &line[1..];
+                    if path.starts_with('/') && !path.contains("(deleted)") {
+                        map.insert(pid, path.to_string());
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    map
 }
 
 // ─── System memory — from vm_stat + sysctl ─────────────────────────────────

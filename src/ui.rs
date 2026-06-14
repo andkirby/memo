@@ -1,4 +1,5 @@
-use crate::app::{App, ViewMode};
+use crate::app::App;
+use crate::group::GroupMode;
 use crate::scanner::format_size;
 use ratatui::{
     Frame,
@@ -139,6 +140,7 @@ fn render_overview(f: &mut Frame, app: &mut App, area: Rect) {
         // Swap label + health
         let (health, health_color) = app.health_status();
         let warning = if mem.swap_pct() > 80.0 { " ⚠ swapping" } else { "" };
+        let noun = match app.group_mode { GroupMode::Project => "projects", GroupMode::App => "apps" };
         let swap_label = Line::from(vec![
             Span::styled(" Swap ", Style::default().fg(Color::Rgb(70, 180, 220)).add_modifier(Modifier::BOLD)),
             Span::styled(
@@ -152,8 +154,9 @@ fn render_overview(f: &mut Frame, app: &mut App, area: Rect) {
             Span::styled(health, Style::default().fg(health_color).add_modifier(Modifier::BOLD)),
             Span::raw("  "),
             Span::styled(
-                format!("{} apps · {} procs · {} phys · {} swap{}",
+                format!("{} {} · {} procs · {} phys · {} swap{}",
                     app.groups.len(),
+                    noun,
                     app.all_processes.len(),
                     format_size(app.total_phys),
                     format_size(app.total_swap),
@@ -172,15 +175,20 @@ fn render_overview(f: &mut Frame, app: &mut App, area: Rect) {
     }
 }
 fn render_process_table(f: &mut Frame, app: &mut App, area: Rect) {
-    let title = match app.view_mode {
-        ViewMode::Overview => " Top Apps (grouped by application) ",
-        ViewMode::Ps => " All Processes (grouped) ",
+    let title = match app.group_mode {
+        GroupMode::Project => " Top Projects (grouped by project dir) ",
+        GroupMode::App => " Top Apps (grouped by application) ",
+    };
+    let (name_header, bridge_header) = match app.group_mode {
+        GroupMode::Project => ("PROJECT", "RUNTIMES"),
+        GroupMode::App => ("APP", "PROJECTS"),
     };
 
     let header_style = Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD);
     let selected_style = Style::default().add_modifier(Modifier::REVERSED);
 
-    let header_cells = ["APP", "PROCS", "RSS", "SWAP", "TOTAL", "THREADS"]
+    let header_row = [name_header, "PROCS", bridge_header, "RSS", "SWAP", "TOTAL"];
+    let header_cells = header_row
         .iter()
         .map(|h| Cell::from(*h).style(header_style));
     let header = Row::new(header_cells).height(1).bottom_margin(1);
@@ -200,13 +208,14 @@ fn render_process_table(f: &mut Frame, app: &mut App, area: Rect) {
             Style::default().fg(Color::White)
         };
 
+        let bridge = group.bridge(app.group_mode);
         let row = Row::new(vec![
             Cell::from(format!("{}{}", prefix, group.name)).style(name_style),
             Cell::from(group.processes.len().to_string()),
+            Cell::from(bridge).style(Style::default().fg(Color::DarkGray)),
             Cell::from(format_size(group.total_rss)).style(Style::default().fg(Color::Green)),
             Cell::from(format_size(group.total_swap)).style(swap_color(group.total_swap)),
             Cell::from(format_size(group.total())).style(total_color(group.total())),
-            Cell::from(group.thread_count.to_string()),
         ]).height(1);
 
         rows.push(row);
@@ -218,10 +227,10 @@ fn render_process_table(f: &mut Frame, app: &mut App, area: Rect) {
                 let child_row = Row::new(vec![
                     Cell::from(format!("    PID {}", proc.pid)).style(Style::default().fg(Color::DarkGray)),
                     Cell::from(""),
+                    Cell::from(""),
                     Cell::from(format_size(proc.rss)).style(Style::default().fg(Color::DarkGray)),
                     Cell::from(format_size(proc.swap)).style(Style::default().fg(Color::DarkGray)),
                     Cell::from(format_size(proc.total())).style(total_color(proc.total())),
-                    Cell::from(proc.threads.to_string()).style(Style::default().fg(Color::DarkGray)),
                 ]).height(1);
                 rows.push(child_row);
                 row_map.push((gi, Some(pi)));  // sub-process row
@@ -233,12 +242,12 @@ fn render_process_table(f: &mut Frame, app: &mut App, area: Rect) {
     app.row_map.entries = row_map;
 
     let widths = [
-        Constraint::Percentage(30),
-        Constraint::Length(7),
-        Constraint::Percentage(15),
-        Constraint::Percentage(15),
-        Constraint::Percentage(15),
-        Constraint::Length(8),
+        Constraint::Percentage(26),
+        Constraint::Length(6),
+        Constraint::Percentage(26),
+        Constraint::Percentage(13),
+        Constraint::Percentage(13),
+        Constraint::Percentage(13),
     ];
 
     let table = Table::new(rows, widths)
@@ -293,18 +302,19 @@ fn render_status(f: &mut Frame, app: &mut App, area: Rect) {
     let controls = vec![
         Line::from(vec![
             Span::styled("↑↓", keys), Span::styled(" Navigate  ", desc),
-            Span::styled("Enter", keys), Span::styled(" Expand/Collapse  ", desc),
+            Span::styled("Enter", keys), Span::styled(" Expand  ", desc),
             Span::styled("D", keys), Span::styled(" Detail  ", desc),
             Span::styled("X", keys), Span::styled(" Kill  ", desc),
         ]),
         Line::from(vec![
+            Span::styled("Tab", keys), Span::styled(" App/Project  ", desc),
             Span::styled("R", keys), Span::styled(" Refresh  ", desc),
-            Span::styled("Q", keys), Span::styled(" Quit  ", desc),
             Span::styled("Sort: ", desc),
-            Span::styled("T", keys), Span::styled("otal ", desc),
-            Span::styled("P", keys), Span::styled("hys ", desc),
-            Span::styled("S", keys), Span::styled("wap ", desc),
-            Span::styled("N", keys), Span::styled("ame ", desc),
+            Span::styled("T", keys), Span::styled(" ", desc),
+            Span::styled("P", keys), Span::styled(" ", desc),
+            Span::styled("S", keys), Span::styled(" ", desc),
+            Span::styled("N", keys), Span::styled("  ", desc),
+            Span::styled("Q", keys), Span::styled(" Quit", desc),
         ]),
     ];
     f.render_widget(

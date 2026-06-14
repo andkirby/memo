@@ -4,6 +4,33 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [0.2.0] - 2026-06-14
+
+### Added
+- **Project grouping mode** — group processes by project directory, resolved
+  from cwd via marker walkup (`.git` / `package.json` / `pyproject.toml` / …).
+  All runtimes of one project (node + bun + python + shells + agents) merge
+  into one row. See `docs/adr/0001-group-by-project.md`.
+- **Bridge column** — shows the other view's key (runtime breakdown in Project
+  mode, distinct project count in App mode) so switching views loses no info.
+- `--group app|project` CLI flag (default `app`; `--ps` unchanged).
+- Bulk `lsof -d cwd` backfill for cwd where sysinfo omits it (one call,
+  ~0.14s).
+- TUI default mode is now **Project**; `Tab` toggles App ↔ Project.
+
+### Changed
+- `Tab` previously toggled Overview/Ps (a no-op that only relabelled the
+  title); it now toggles App ↔ Project for real.
+- `THREADS` column removed (sysinfo 0.33 doesn't expose threads — always 1);
+  replaced by the bridge column.
+- Dev runtimes (node/bun/deno/python) group to a single row each in App mode;
+  the per-project split moves to the bridge column.
+
+### Removed
+- `extract_project` / `extract_python_module` hint logic (superseded by marker
+  walkup + bridge column).
+- `ViewMode { Overview, Ps }` enum (replaced by `GroupMode { App, Project }`).
+
 ## [0.1.0] - 2026-06-11
 
 ### Added

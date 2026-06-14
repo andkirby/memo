@@ -1,4 +1,4 @@
-use crate::group::AppGroup;
+use crate::group::{AppGroup, GroupMode};
 use crate::scanner::{ProcessMemory, SystemMemory};
 use ratatui::layout::Rect;
 use ratatui::widgets::TableState;
@@ -19,9 +19,9 @@ impl RowMap { pub fn new() -> Self { Self::default() } }
 pub enum SortColumn { Name, Physical, Swap, Total }
 
 // ─── View mode ──────────────────────────────────────────────────────────────
-
-#[derive(Debug, Clone, PartialEq)]
-pub enum ViewMode { Overview, Ps }
+// ViewMode { Overview, Ps } removed — see ADR 0001. The TUI's old Tab toggle
+// only relabelled the title; both modes rendered app-grouped data. Replaced by
+// GroupMode { App, Project } which actually changes the grouping key.
 
 // ─── Process detail (for popup) ────────────────────────────────────────────
 
@@ -45,7 +45,7 @@ pub struct ProcessDetail {
 
 pub struct App {
     pub should_quit: bool,
-    pub view_mode: ViewMode,
+    pub group_mode: GroupMode,
     pub system_memory: Option<SystemMemory>,
     pub groups: Vec<AppGroup>,
     pub all_processes: Vec<ProcessMemory>,
@@ -71,7 +71,7 @@ impl App {
     pub fn new() -> Self {
         Self {
             should_quit: false,
-            view_mode: ViewMode::Overview,
+            group_mode: GroupMode::Project,
             system_memory: None,
             groups: Vec::new(),
             all_processes: Vec::new(),
@@ -151,6 +151,23 @@ impl App {
         }
     }
 
+    // ─── Group mode ────────────────────────────────────────────────────
+
+    /// Toggle App ↔ Project grouping and regroup from scanned data.
+    pub fn cycle_group(&mut self) {
+        self.group_mode = match self.group_mode {
+            GroupMode::Project => GroupMode::App,
+            GroupMode::App => GroupMode::Project,
+        };
+        let procs = self.all_processes.clone();
+        self.recalculate_from(&procs);
+        self.expanded_group = None;
+        self.proc_state.select(None);
+        if !self.groups.is_empty() {
+            self.group_state.select(Some(0));
+        }
+    }
+
     // ─── Sort ───────────────────────────────────────────────────────────
 
     pub fn sort_groups(&mut self) {
@@ -182,7 +199,7 @@ impl App {
     pub fn recalculate_from(&mut self, processes: &[ProcessMemory]) {
         self.total_phys = processes.iter().map(|p| p.rss).sum();
         self.total_swap = processes.iter().map(|p| p.swap).sum();
-        self.groups = crate::group::group_processes(processes);
+        self.groups = crate::group::group_processes(processes, self.group_mode);
     }
 
     // ─── Health ─────────────────────────────────────────────────────────
