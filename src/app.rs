@@ -62,6 +62,7 @@ pub struct App {
     pub status_message: Option<String>,
     pub detail_view_open: bool,
     pub current_detail: Option<ProcessDetail>,
+    pub popup_area: Option<Rect>,   // Some while the detail popup is on screen
     pub spinner_idx: usize,
     pub total_phys: u64,
     pub total_swap: u64,
@@ -88,6 +89,7 @@ impl App {
             status_message: None,
             detail_view_open: false,
             current_detail: None,
+            popup_area: None,
             spinner_idx: 0,
             total_phys: 0,
             total_swap: 0,
@@ -243,8 +245,65 @@ impl App {
         self.group_state.select(Some(visual_idx));
         self.sync_from_visual(visual_idx);
     }
+    /// While the detail popup is open, a left-click outside its area closes it.
+    /// Clicks inside the popup are swallowed (it has no interactive widgets).
+    /// Other mouse events are gated on `detail_view_open` by the caller.
+    pub fn dismiss_popup_if_outside(&mut self, row: u16, col: u16) {
+        let outside = self.popup_area.map_or(true, |r| {
+            col < r.x || col >= r.x + r.width || row < r.y || row >= r.y + r.height
+        });
+        if outside {
+            self.detail_view_open = false;
+        }
+    }
 
     pub fn scroll_table(&mut self, up: bool) {
         if up { self.prev_group(); } else { self.next_group(); }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn app_with_popup() -> App {
+        let mut app = App::new();
+        app.detail_view_open = true;
+        // 10x10 popup with top-left at (col=5, row=5)
+        app.popup_area = Some(Rect::new(5, 5, 10, 10));
+        app
+    }
+
+    #[test]
+    fn popup_click_outside_dismisses() {
+        let mut app = app_with_popup();
+        app.dismiss_popup_if_outside(0, 0); // top-left of screen — outside
+        assert!(!app.detail_view_open, "outside click should close the popup");
+    }
+
+    #[test]
+    fn popup_click_inside_keeps_open() {
+        let mut app = app_with_popup();
+        app.dismiss_popup_if_outside(9, 9); // centre — inside
+        assert!(app.detail_view_open, "inside click should keep the popup open");
+    }
+
+    #[test]
+    fn popup_dismiss_is_noop_when_closed() {
+        let mut app = App::new();
+        app.detail_view_open = false;
+        app.dismiss_popup_if_outside(0, 0); // must not panic with popup_area == None
+        assert!(!app.detail_view_open);
+    }
+
+    #[test]
+    fn popup_boundary_is_half_open() {
+        let mut app = app_with_popup();
+        app.dismiss_popup_if_outside(5, 5); // top-left corner — inside
+        assert!(app.detail_view_open, "corner (x,y) is inside");
+
+        let mut app = app_with_popup();
+        app.dismiss_popup_if_outside(5, 15); // col == x+width — outside
+        assert!(!app.detail_view_open, "col == x+width is outside");
     }
 }

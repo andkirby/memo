@@ -191,32 +191,44 @@ fn run_tui() -> Result<()> {
         if crossterm::event::poll(timeout)? && let Ok(ev) = event::read() {
             match ev {
                 Event::Mouse(mouse) => match mouse.kind {
-                    MouseEventKind::ScrollUp => app.scroll_table(true),
-                    MouseEventKind::ScrollDown => app.scroll_table(false),
+                    MouseEventKind::ScrollUp => {
+                        if !app.detail_view_open { app.scroll_table(true); }
+                    }
+                    MouseEventKind::ScrollDown => {
+                        if !app.detail_view_open { app.scroll_table(false); }
+                    }
                     MouseEventKind::Down(crossterm::event::MouseButton::Left) => {
-                        // Detect double-click (same row within 400ms)
-                        let now = Instant::now();
-                        let is_double = last_click.map_or(false, |(r, _c, t)| {
-                            r == mouse.row && now.duration_since(t) < Duration::from_millis(400)
-                        });
-                        last_click = Some((mouse.row, mouse.column, now));
-
-                        if is_double {
-                            // Double-click on sub-process = open detail
-                            if let Some((_gi, pi)) = app.selected_process() {
-                                if pi.is_some() {
-                                    app.detail_view_open = true;
-                                    app.current_detail = None;
-                                    show_detail(&app, &tx);
-                                } else {
-                                    app.toggle_expand();
-                                }
-                            }
+                        // The detail popup is modal: a click outside dismisses it
+                        // and the event is swallowed (no table interaction behind).
+                        if app.detail_view_open {
+                            app.dismiss_popup_if_outside(mouse.row, mouse.column);
                         } else {
-                            app.click_table(mouse.row, mouse.column);
+                            // Detect double-click (same row within 400ms)
+                            let now = Instant::now();
+                            let is_double = last_click.map_or(false, |(r, _c, t)| {
+                                r == mouse.row && now.duration_since(t) < Duration::from_millis(400)
+                            });
+                            last_click = Some((mouse.row, mouse.column, now));
+
+                            if is_double {
+                                // Double-click on sub-process = open detail
+                                if let Some((_gi, pi)) = app.selected_process() {
+                                    if pi.is_some() {
+                                        app.detail_view_open = true;
+                                        app.current_detail = None;
+                                        show_detail(&app, &tx);
+                                    } else {
+                                        app.toggle_expand();
+                                    }
+                                }
+                            } else {
+                                app.click_table(mouse.row, mouse.column);
+                            }
                         }
                     }
-                    MouseEventKind::Down(crossterm::event::MouseButton::Right) => app.toggle_expand(),
+                    MouseEventKind::Down(crossterm::event::MouseButton::Right) => {
+                        if !app.detail_view_open { app.toggle_expand(); }
+                    }
                     _ => {}
                 },
                 Event::Key(key) => {

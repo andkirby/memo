@@ -12,6 +12,7 @@ use ratatui::{
 const SPINNER: &[&str] = &["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
 
 pub fn ui(f: &mut Frame, app: &mut App) {
+    app.popup_area = None;   // cleared each frame; set by render_detail_popup
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
@@ -350,6 +351,7 @@ fn render_status(f: &mut Frame, app: &mut App, area: Rect) {
 
 fn render_detail_popup(f: &mut Frame, app: &mut App) {
     let area = centered_rect(80, 75, f.area());
+    app.popup_area = Some(area);
     f.render_widget(Clear, area);
 
     let block = Block::default()
