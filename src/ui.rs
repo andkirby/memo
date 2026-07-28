@@ -56,7 +56,7 @@ fn render_overview(f: &mut Frame, app: &mut App, area: Rect) {
         let total = mem.total_bytes.max(1) as f64;
         let app_pct = mem.app_memory as f64 / total;
         let wired_pct = mem.wired as f64 / total;
-        let comp_pct = 0 as f64 / total;
+        let comp_pct = mem.compressed as f64 / total;
         let cache_pct = mem.cache as f64 / total;
         let used_pct = app_pct + wired_pct + comp_pct + cache_pct;
 
@@ -109,7 +109,7 @@ fn render_overview(f: &mut Frame, app: &mut App, area: Rect) {
             Span::styled(format!(" Wired {}", format_size(mem.wired)), Style::default().fg(Color::Rgb(140, 140, 150))),
             Span::raw("  "),
             Span::styled("■", Style::default().fg(Color::Rgb(180, 100, 220))),
-            Span::styled(format!(" Compressed {}", format_size(0)), Style::default().fg(Color::Rgb(140, 140, 150))),
+            Span::styled(format!(" Compressed {}", format_size(mem.compressed)), Style::default().fg(Color::Rgb(140, 140, 150))),
             Span::raw("  "),
             Span::styled("■", Style::default().fg(Color::Rgb(80, 180, 120))),
             Span::styled(format!(" Cache {}", format_size(mem.cache)), Style::default().fg(Color::Rgb(140, 140, 150))),
