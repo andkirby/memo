@@ -4,6 +4,18 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [0.2.1] - 2026-07-28
+
+### Fixed
+- **Compressed memory now shown in the TUI.** The RAM bar segment and
+  label both rendered `0`, discarding the value the scanner computed —
+  the bar read "Compressed 0B" and the usage percentage was ~30 pts low.
+  The scanner and `--cli` path were already correct; the bug was TUI-only.
+- **Detail popup no longer lets clicks pass through.** With the popup
+  open, mouse scroll and right-click acted on the table behind it and a
+  left-click selected rows behind it. The popup is now modal: scroll and
+  right-click are swallowed, and a left-click outside dismisses it.
+
 ## [0.2.0] - 2026-06-14
 
 ### Added
