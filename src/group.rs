@@ -152,7 +152,7 @@ fn canonical_app_name(name: &str, cmdline: &str) -> String {
 
 // ─── Project resolution: cwd → nearest marker ──────────────────────────────
 
-const MARKERS: &[&str] = &[
+pub(crate) const MARKERS: &[&str] = &[
     ".git", "package.json", "pyproject.toml", "bun.lockb", "bun.lock",
     "Cargo.toml", "go.mod", "pom.xml", "Makefile", "composer.json",
 ];

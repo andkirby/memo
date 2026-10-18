@@ -8,6 +8,24 @@
 4. **Grouping is a pure function of the process list** — `group_processes(procs, mode)` has no hidden state. Switching the view (App ↔ Project) re-pivots the same scanned data; it never re-fetches.
 5. **Project identity is observed, not declared** — a process's project is recovered from its cwd (+ marker walkup), with no per-service instrumentation. See [ADR 0001](docs/adr/0001-group-by-project.md).
 
+## Agent inspection
+
+`memo inspect` is a one-shot, RSS-only path alongside the existing TUI and
+legacy CLI. `main.rs` parses and dispatches commands and reuses `collect_processes`;
+`inspect.rs` resolves scope, normalizes observed cwd paths, aggregates matching
+processes, and renders text or versioned JSON. It never invokes `footprint`.
+
+Automatic scope prefers the nearest enclosing `.git` directory or worktree
+file, then the nearest other project marker from the shared `group.rs` marker
+list. An explicit project path selects that exact directory. Canonical cwd
+containment determines membership; no command-line or ancestry hints widen it.
+The inspector's own PID is excluded. Row limits affect output, not totals.
+
+This is distinct from the TUI's nearest-marker/hybrid grouping. The process
+memory model and existing grouping rules are unchanged. Missing cwd limits
+attribution, and swap is unmeasured. The authoritative command, output, and
+error contract is [Agent inspection](docs/agent-inspection.md).
+
 ## Data flow
 
 ```

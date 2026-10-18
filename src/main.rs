@@ -1,6 +1,7 @@
 mod app;
 mod footprint;
 mod group;
+mod inspect;
 mod scanner;
 mod ui;
 
@@ -15,7 +16,7 @@ use std::{
 
 use anyhow::Result;
 use app::{App, ProcessDetail, SortColumn};
-use clap::Parser;
+use clap::{Parser, Subcommand};
 use crossterm::{
     event::{self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, MouseEvent, MouseEventKind},
     execute,
@@ -26,11 +27,12 @@ use scanner::{ProcessMemory, format_size, get_system_memory};
 use sysinfo::{Pid, System};
 
 #[derive(Parser, Debug)]
-#[command(name = "memo", about = "Quick memory usage analysis", version, disable_version_flag = true)]
+#[command(name = "memo", about = "Quick memory usage analysis", version, disable_version_flag = true,
+    args_conflicts_with_subcommands = true)]
 struct Args {
     /// Print version
     #[arg(short = 'v', long, action = clap::ArgAction::Version)]
-    version: bool,
+    version: Option<bool>,
 
     /// CLI mode (dump to stdout and exit)
     #[arg(long)]
@@ -47,6 +49,27 @@ struct Args {
     /// Group mode for --cli: app, project
     #[arg(long, default_value = "app")]
     group: String,
+
+    #[command(subcommand)]
+    command: Option<Command>,
+}
+
+#[derive(Subcommand, Debug)]
+enum Command {
+    /// Project-scoped memory snapshot for agents (RSS only)
+    Inspect {
+        /// Machine-readable JSON on stdout (single line)
+        #[arg(long)]
+        json: bool,
+
+        /// Project directory (default: nearest enclosing .git / marker)
+        #[arg(long, value_name = "PATH")]
+        project: Option<String>,
+
+        /// Max processes to list, >= 1
+        #[arg(long, value_name = "N", default_value = "5")]
+        limit: String,
+    },
 }
 
 // ─── Scan events (background → main thread) ────────────────────────────────
@@ -62,7 +85,31 @@ enum ScanEvent {
 // ─── Entry point ────────────────────────────────────────────────────────────
 
 fn main() -> Result<()> {
-    let args = Args::parse();
+    let raw_args: Vec<_> = std::env::args_os().collect();
+    let json_requested = raw_args.iter().any(|arg| arg == "inspect")
+        && raw_args.iter().any(|arg| arg == "--json");
+    let args = match Args::try_parse_from(&raw_args) {
+        Ok(args) => args,
+        Err(error) => {
+            if json_requested && error.use_stderr() {
+                println!("{}", serde_json::json!({
+                    "version": inspect::REPORT_VERSION,
+                    "error": { "code": "bad_argument", "message": error.to_string() }
+                }));
+                std::process::exit(2);
+            }
+            error.exit();
+        }
+    };
+
+    if let Some(Command::Inspect { json, project, limit }) = &args.command {
+        let code = inspect::run(inspect::InspectArgs {
+            json: *json,
+            project: project.clone(),
+            limit: limit.clone(),
+        });
+        std::process::exit(code);
+    }
 
     if args.cli || args.ps {
         run_cli(args)?;
@@ -503,4 +550,38 @@ fn parallel_swap_scan(pids: &[i32]) -> HashMap<i32, u64> {
 
 fn truncate(s: &str, max: usize) -> String {
     if s.len() > max { format!("{}…", &s[..max - 1]) } else { s.to_string() }
+}
+
+#[cfg(test)]
+mod cli_tests {
+    use super::Args;
+    use clap::{Parser, error::ErrorKind};
+
+    #[test]
+    fn version_does_not_become_required_for_normal_commands() {
+        let tui = Args::try_parse_from(["memo"]).expect("plain startup must parse");
+        assert!(!tui.cli && !tui.ps);
+        assert!(Args::try_parse_from(["memo", "--cli"]).unwrap().cli);
+        assert!(Args::try_parse_from(["memo", "--ps"]).unwrap().ps);
+    }
+
+    #[test]
+    fn both_version_flags_display_the_package_version() {
+        for flag in ["--version", "-v"] {
+            let result = Args::try_parse_from(["memo", flag]).unwrap_err();
+            assert_eq!(result.kind(), ErrorKind::DisplayVersion);
+            assert_eq!(result.to_string(), format!("memo {}\n", env!("CARGO_PKG_VERSION")));
+        }
+    }
+
+    #[test]
+    fn inspect_rejects_explicit_legacy_flags_even_with_default_values() {
+        for flag in ["--sort", "--group"] {
+            let value = if flag == "--sort" { "total" } else { "app" };
+            assert!(Args::try_parse_from(["memo", flag, value, "inspect", "--json"]).is_err());
+        }
+        assert!(Args::try_parse_from(["memo", "--cli", "inspect"]).is_err());
+        assert!(Args::try_parse_from(["memo", "inspect", "--ps"]).is_err());
+        assert!(Args::try_parse_from(["memo", "inspect", "--json"]).is_ok());
+    }
 }

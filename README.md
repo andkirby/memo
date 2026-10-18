@@ -82,7 +82,19 @@ memo --cli --sort rss     # by resident memory
 memo --cli --sort swap    # by swap usage
 memo --cli --sort total   # by total (default)
 memo --cli --sort name    # alphabetically
+
+# Agent queries — current project, RSS only (no swap scan)
+memo inspect
+memo inspect --json
+memo inspect --project /path/to/project --limit 20
+
+# Executable version
+memo --version           # also: memo -v
 ```
+
+See [Agent inspection](docs/agent-inspection.md) for scope rules, JSON fields,
+and error handling. Automatic scope prefers the enclosing Git worktree root;
+project processes are matched by their observed working directories.
 
 ## TUI Controls
 
@@ -124,12 +136,16 @@ Steps 1-2 take <1s. Step 3 takes ~8s for ~350 processes (parallel batches of 20 
 
 ## Architecture
 
+Agent interface: [current contract](docs/agent-inspection.md) and
+[original idea and deferred extensions](docs/ideas/IDEA-001-agent-project-inspection.md).
+
 ```
 src/
 ├── main.rs        CLI parsing, TUI event loop, scan orchestration
 ├── scanner.rs     ProcessMemory, SystemMemory, vm_stat/sysctl parsing
 ├── footprint.rs   macOS footprint CLI wrapper (swap data only)
 ├── group.rs       Process grouping — App or Project mode (marker walkup on cwd)
+├── inspect.rs     Project-scoped RSS query: scope, aggregation, text/JSON output
 ├── app.rs         TUI state: navigation, selection, sort, row mapping
 ├── ui.rs          ratatui rendering: header bars, table, detail popup
 └── top.rs         (unused — kept for potential future use)

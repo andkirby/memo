@@ -4,6 +4,35 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [0.3.0] - 2026-10-18
+
+### Added
+- **`memo inspect` — project-scoped memory snapshot for agents.** Resolves
+  the current project automatically (nearest enclosing `.git` — directory or
+  worktree file — else nearest project marker), attributes processes by cwd
+  (scope folder and descendants, inspector excluded), and reports total
+  process count, aggregate RSS, and the top `--limit` (default 5) processes
+  sorted by RSS with a compact command label. `--json` emits a stable
+  versioned single-line object (integer bytes, compact error objects,
+  exit 2 for scope/argument errors); `--project PATH` selects an exact
+  directory anywhere on disk. Totals always cover every matched process;
+  swap is omitted (not measured) in this release. Contract and rules:
+  `docs/agent-inspection.md`.
+- **Version flags** — `-v` / `--version` print the version without starting
+  the TUI.
+
+### Fixed
+- **Expanded project groups are readable.** Child rows show process name,
+  pid, and command in a tree-guide layout, follow the active sort key
+  (headers show `TOTAL ↓`-style arrows), numeric columns are right-aligned,
+  the RUNTIMES cell fits whole `name:count` tokens (`node:100 +2`) at the
+  column's real width, and zero swap renders neutral instead of green.
+- **Mouse clicks land on the displayed row after scrolling.** The click
+  handler ignored the table's scroll offset, so a click selected a row
+  several positions above the one clicked.
+- **PageUp/PageDown (Fn+↑ / Fn+↓) page the process table**, clamped at both
+  ends.
+
 ## [0.2.1] - 2026-07-28
 
 ### Fixed
