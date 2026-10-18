@@ -10,6 +10,7 @@ path = "src/main.rs"
 
 [dependencies]
 ratatui = "0.29"
+unicode-width = "0.2"
 crossterm = "0.28"
 anyhow = "1.0"
 regex = "1"

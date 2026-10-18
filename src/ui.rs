@@ -1,15 +1,29 @@
-use crate::app::App;
+use crate::app::{App, SortColumn};
 use crate::group::GroupMode;
 use crate::scanner::format_size;
 use ratatui::{
     Frame,
-    layout::{Alignment, Constraint, Direction, Layout, Rect},
+    layout::{Alignment, Constraint, Direction, Flex, Layout, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span},
     widgets::{Block, Borders, Cell, Clear, Gauge, Paragraph, Row, Table, Wrap},
 };
+use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 const SPINNER: &[&str] = &["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
+
+/// Column layout shared by the Table widget and `bridge_column_width`, so the
+/// width-aware RUNTIMES cell always matches what is actually rendered.
+const TABLE_WIDTHS: [Constraint; 6] = [
+    Constraint::Percentage(26),
+    Constraint::Length(6),
+    Constraint::Percentage(26),
+    Constraint::Percentage(13),
+    Constraint::Percentage(13),
+    Constraint::Percentage(13),
+];
+
+const HIGHLIGHT_SYMBOL: &str = ">> ";
 
 pub fn ui(f: &mut Frame, app: &mut App) {
     app.popup_area = None;   // cleared each frame; set by render_detail_popup
@@ -181,42 +195,62 @@ fn render_process_table(f: &mut Frame, app: &mut App, area: Rect) {
         GroupMode::App => " Top Apps (grouped by application) ",
     };
     let (name_header, bridge_header) = match app.group_mode {
-        GroupMode::Project => ("PROJECT", "RUNTIMES"),
+        GroupMode::Project => ("PROJECT", "RUNTIMES / COMMAND"),
         GroupMode::App => ("APP", "PROJECTS"),
     };
 
     let header_style = Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD);
     let selected_style = Style::default().add_modifier(Modifier::REVERSED);
 
-    let header_row = [name_header, "PROCS", bridge_header, "RSS", "SWAP", "TOTAL"];
-    let header_cells = header_row
-        .iter()
-        .map(|h| Cell::from(*h).style(header_style));
+    let arrow = |col: SortColumn| sort_arrow(app.sort_column, col, app.sort_desc);
+    let right = |s: String, style: Style| Cell::from(Line::styled(s, style).alignment(Alignment::Right));
+
+    let header_row = [
+        format!("{}{}", name_header, arrow(SortColumn::Name)),
+        "PROCS".to_string(),
+        bridge_header.to_string(),
+        format!("RSS{}", arrow(SortColumn::Physical)),
+        format!("SWAP{}", arrow(SortColumn::Swap)),
+        format!("TOTAL{}", arrow(SortColumn::Total)),
+    ];
+    let header_cells = header_row.iter().enumerate().map(|(i, h)| {
+        if i == 2 { Cell::from(h.as_str()).style(header_style) }  // bridge column stays left-aligned
+        else { right(h.clone(), header_style) }
+    });
     let header = Row::new(header_cells).height(1).bottom_margin(1);
 
     let expanded = app.expanded_group;
+    let cols = table_columns(area, app.group_state.selected().is_some());
+    let bridge_width = cols[2].width as usize;
+    let name_width = cols[0].width as usize;
 
     let mut rows: Vec<Row> = Vec::new();
     let mut row_map: Vec<(usize, Option<usize>)> = Vec::new();
     for (gi, group) in app.groups.iter().enumerate() {
         let is_expanded = expanded == Some(gi);
         let prefix = if is_expanded { "▾ " } else { "▸ " };
+        // Expanded parent is highlighted; collapsed parents are bold so the
+        // hierarchy reads even before any child rows are shown.
         let name_style = if is_expanded {
             Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)
-        } else if group.processes.len() > 3 {
-            Style::default().fg(Color::White).add_modifier(Modifier::BOLD)
         } else {
-            Style::default().fg(Color::White)
+            Style::default().fg(Color::White).add_modifier(Modifier::BOLD)
         };
 
-        let bridge = group.bridge(app.group_mode);
+        // App mode keeps bridge()'s human formatting ("3 projects"); Project
+        // mode gets width-aware token fitting ("node:100 +2").
+        let bridge_cell = if app.group_mode == GroupMode::App {
+            group.bridge(app.group_mode)
+        } else {
+            fit_bridge_tokens(&group.bridge_tokens(app.group_mode), bridge_width)
+        };
         let row = Row::new(vec![
             Cell::from(format!("{}{}", prefix, group.name)).style(name_style),
-            Cell::from(group.processes.len().to_string()),
-            Cell::from(bridge).style(Style::default().fg(Color::DarkGray)),
-            Cell::from(format_size(group.total_rss)).style(Style::default().fg(Color::Green)),
-            Cell::from(format_size(group.total_swap)).style(swap_color(group.total_swap)),
-            Cell::from(format_size(group.total())).style(total_color(group.total())),
+            right(group.processes.len().to_string(), Style::default()),
+            Cell::from(bridge_cell).style(Style::default().fg(Color::DarkGray)),
+            right(format_size(group.total_rss), Style::default().fg(Color::Green)),
+            right(format_size(group.total_swap), swap_color(group.total_swap)),
+            right(format_size(group.total()), total_color(group.total())),
         ]).height(1);
 
         rows.push(row);
@@ -224,14 +258,27 @@ fn render_process_table(f: &mut Frame, app: &mut App, area: Rect) {
 
         // If expanded, show child processes
         if is_expanded {
+            let n = group.processes.len();
             for (pi, proc) in group.processes.iter().enumerate() {
+                let guide = if pi + 1 == n { "└─ " } else { "├─ " };
+                // Reserve room for the pid suffix so long names clip, not the pid.
+                let pid_span = format!(" · {}", proc.pid);
+                let name_budget = name_width
+                    .saturating_sub(2 + guide.width() + pid_span.width());
                 let child_row = Row::new(vec![
-                    Cell::from(format!("    PID {}", proc.pid)).style(Style::default().fg(Color::DarkGray)),
+                    // Name stays readable; only the tree guide and pid are dimmed.
+                    Cell::from(Line::from(vec![
+                        Span::styled(
+                            format!("  {}{}", guide, truncate_ellipsis(&proc.name, name_budget)),
+                            Style::default().fg(Color::White),
+                        ),
+                        Span::styled(pid_span, Style::default().fg(Color::DarkGray)),
+                    ])),
                     Cell::from(""),
-                    Cell::from(""),
-                    Cell::from(format_size(proc.rss)).style(Style::default().fg(Color::DarkGray)),
-                    Cell::from(format_size(proc.swap)).style(Style::default().fg(Color::DarkGray)),
-                    Cell::from(format_size(proc.total())).style(total_color(proc.total())),
+                    Cell::from(short_cmd(&proc.cmdline, bridge_width)).style(Style::default().fg(Color::DarkGray)),
+                    right(format_size(proc.rss), Style::default().fg(Color::Green)),
+                    right(format_size(proc.swap), swap_color(proc.swap)),
+                    right(format_size(proc.total()), total_color(proc.total())),
                 ]).height(1);
                 rows.push(child_row);
                 row_map.push((gi, Some(pi)));  // sub-process row
@@ -242,26 +289,112 @@ fn render_process_table(f: &mut Frame, app: &mut App, area: Rect) {
     // Store the row map so main.rs can use it for navigation
     app.row_map.entries = row_map;
 
-    let widths = [
-        Constraint::Percentage(26),
-        Constraint::Length(6),
-        Constraint::Percentage(26),
-        Constraint::Percentage(13),
-        Constraint::Percentage(13),
-        Constraint::Percentage(13),
-    ];
+    let widths = TABLE_WIDTHS;
 
     let table = Table::new(rows, widths)
         .header(header)
         .block(Block::default().borders(Borders::ALL).title(title))
         .row_highlight_style(selected_style)
-        .highlight_symbol(">> ");
+        .highlight_symbol(HIGHLIGHT_SYMBOL);
 
     f.render_stateful_widget(table, area, &mut app.group_state);
 }
 
+fn sort_arrow(active: SortColumn, col: SortColumn, desc: bool) -> &'static str {
+    if active == col {
+        if desc { " ↓" } else { " ↑" }
+    } else {
+        ""
+    }
+}
+
+/// Widths of all six table columns, mirroring ratatui 0.29's Table layout:
+/// the selection gutter is allocated first (`Length(gutter) + Fill(0)`), then
+/// the shared `TABLE_WIDTHS` with `Flex::Start` and spacing 1 on what remains.
+fn table_columns(area: Rect, has_selection: bool) -> Vec<Rect> {
+    let inner_w = area.width.saturating_sub(2);  // block borders
+    let [_gutter, columns] = Layout::horizontal([
+        Constraint::Length(if has_selection { HIGHLIGHT_SYMBOL.len() as u16 } else { 0 }),
+        Constraint::Fill(0),
+    ])
+    .areas(Rect::new(0, 0, inner_w, 1));
+    Layout::horizontal(TABLE_WIDTHS)
+        .flex(Flex::Start)
+        .spacing(1)
+        .split(columns)
+        .to_vec()
+}
+
+/// Compact command for a child row: executable basename plus first argument
+/// (so a leading flag stays visible), truncated to `max` display columns.
+/// The cmdline is a flattened string, so whitespace splitting is a display
+/// heuristic, not argv parsing.
+fn short_cmd(cmdline: &str, max: usize) -> String {
+    if max == 0 {
+        return String::new();
+    }
+    let mut parts = cmdline.split_whitespace();
+    let exe = parts.next().unwrap_or("").rsplit('/').next().unwrap_or("");
+    if exe.is_empty() {
+        return String::new();
+    }
+    let out = match parts.next() {
+        Some(arg) => format!("{} {}", exe, arg),
+        None => exe.to_string(),
+    };
+    truncate_ellipsis(&out, max)
+}
+
+/// Truncate `s` to `max` display columns with a trailing ellipsis when needed.
+fn truncate_ellipsis(s: &str, max: usize) -> String {
+    if s.width() <= max {
+        return s.to_string();
+    }
+    if max == 0 {
+        return String::new();
+    }
+    let mut w = 0usize;
+    let mut end = s.len();
+    for (i, c) in s.char_indices() {
+        let cw = c.width().unwrap_or(0);
+        if w + cw > max - 1 {
+            end = i;
+            break;
+        }
+        w += cw;
+    }
+    format!("{}…", &s[..end])
+}
+
+/// Fit whole `family:count` tokens into `width` display columns. When tokens
+/// must be dropped, appends ` +N` where N counts the omitted families —
+/// including any token displaced by the suffix itself. Falls back to `…` and
+/// to empty at width 0.
+fn fit_bridge_tokens(tokens: &[(String, usize)], width: usize) -> String {
+    if width == 0 {
+        return String::new();
+    }
+    let rendered: Vec<String> = tokens.iter().map(|(f, c)| format!("{}:{}", f, c)).collect();
+    for keep in (0..=tokens.len()).rev() {
+        let omitted = tokens.len() - keep;
+        let mut line = rendered[..keep].join(" ");
+        if omitted > 0 {
+            if !line.is_empty() {
+                line.push(' ');
+            }
+            line.push_str(&format!("+{}", omitted));
+        }
+        if line.width() <= width {
+            return line;
+        }
+    }
+    "…".to_string()
+}
+
 fn swap_color(bytes: u64) -> Style {
-    if bytes > 1024 * 1024 * 1024 {
+    if bytes == 0 {
+        Style::default().fg(Color::DarkGray)  // zero swap is neutral, not "good"
+    } else if bytes > 1024 * 1024 * 1024 {
         Style::default().fg(Color::Red)
     } else if bytes > 512 * 1024 * 1024 {
         Style::default().fg(Color::Yellow)
@@ -477,4 +610,236 @@ fn centered_rect(percent_x: u16, percent_y: u16, r: Rect) -> Rect {
             Constraint::Percentage((100 - percent_x) / 2),
         ])
         .split(popup_layout[1])[1]
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::group::GroupKind;
+    use crate::scanner::ProcessMemory;
+    use ratatui::{backend::TestBackend, Terminal};
+
+    // ─── fit_bridge_tokens ──────────────────────────────────────────
+
+    fn toks(pairs: &[(&str, usize)]) -> Vec<(String, usize)> {
+        pairs.iter().map(|(f, c)| (f.to_string(), *c)).collect()
+    }
+
+    #[test]
+    fn bridge_fits_exactly_and_drops_whole_tokens() {
+        let t = toks(&[("esbuild", 100), ("node", 100), ("workerd", 100)]);
+        // 11+1+9+1+12 = 34 display cols — all three fit whole only at width ≥ 34
+        assert_eq!(fit_bridge_tokens(&t, 34), "esbuild:100 node:100 workerd:100");
+        assert_eq!(fit_bridge_tokens(&t, 30), "esbuild:100 node:100 +1");
+        assert_eq!(fit_bridge_tokens(&t, 19), "esbuild:100 +2");
+        assert_eq!(fit_bridge_tokens(&t, 11), "+3");
+        assert_eq!(fit_bridge_tokens(&t, 2), "+3");
+        assert_eq!(fit_bridge_tokens(&t, 1), "…");
+        assert_eq!(fit_bridge_tokens(&t, 0), "");
+    }
+
+    #[test]
+    fn bridge_single_token_overflow_has_no_suffix() {
+        let t = toks(&[("node", 1)]);
+        assert_eq!(fit_bridge_tokens(&t, 3), "+1");
+    }
+
+    #[test]
+    fn bridge_unicode_display_width() {
+        // "日本:2" is 6 display columns (2 wide chars + ":2")
+        let t = toks(&[("日本", 2), ("node", 1)]);
+        assert_eq!(fit_bridge_tokens(&t, 13), "日本:2 node:1");
+        assert_eq!(fit_bridge_tokens(&t, 12), "日本:2 +1");
+        assert_eq!(fit_bridge_tokens(&t, 6), "+2");
+    }
+
+    #[test]
+    fn bridge_empty_tokens() {
+        assert_eq!(fit_bridge_tokens(&[], 10), "");
+        assert_eq!(fit_bridge_tokens(&[], 0), "");
+    }
+
+    // ─── short_cmd ──────────────────────────────────────────────────
+
+    #[test]
+    fn cmd_strips_basename_keeps_flag() {
+        assert_eq!(short_cmd("/opt/homebrew/bin/vite --host", 40), "vite --host");
+        assert_eq!(short_cmd("node server.js", 40), "node server.js");
+    }
+
+    #[test]
+    fn cmd_empty_and_truncation() {
+        assert_eq!(short_cmd("", 10), "");
+        assert_eq!(short_cmd("esbuild --service=0.18.0", 8), "esbuild…");
+        assert_eq!(short_cmd("x", 0), "");
+    }
+
+    // ─── Rendered column width (TestBackend, amendment 2) ──────────
+
+    fn bridge_group() -> crate::group::AppGroup {
+        let mut p = |pid: i32, name: &str, rss: u64| {
+            let mut x = ProcessMemory::new(pid, name.to_string(), rss);
+            x.cmdline = format!("{} serve", name);
+            x
+        };
+        crate::group::AppGroup {
+            name: "~/demo".into(),
+            kind: GroupKind::Project,
+            processes: vec![p(1, "node", 100), p(2, "bun", 50), p(3, "workerd", 25)],
+            total_rss: 175,
+            total_swap: 0,
+            thread_count: 3,
+        }
+    }
+
+    /// Renders the table and returns the text of the first data row.
+    fn rendered_first_row(width: u16, with_selection: bool) -> String {
+        let mut app = App::new();
+        app.groups = vec![bridge_group()];
+        app.expanded_group = Some(0);
+        if with_selection {
+            app.group_state.select(Some(0));
+        }
+        let mut terminal = Terminal::new(TestBackend::new(width, 24)).unwrap();
+        terminal
+            .draw(|f| render_process_table(f, &mut app, f.area()))
+            .unwrap();
+        let buf = terminal.backend().buffer();
+        // border(1) + header(1) + bottom_margin(1) → first data row is y=3
+        (0..buf.area.width)
+            .map(|x| buf[(x, 3)].symbol().to_string())
+            .collect::<String>()
+    }
+
+    #[test]
+    fn rendered_bridge_is_never_clipped_or_overlapped() {
+        for width in [60u16, 100, 160] {
+            for sel in [true, false] {
+                let line = rendered_first_row(width, sel);
+                let expected = fit_bridge_tokens(
+                    &[("bun".into(), 1), ("node".into(), 1), ("workerd".into(), 1)],
+                    table_columns(Rect::new(0, 0, width, 24), sel)[2].width as usize,
+                );
+                assert!(
+                    line.contains(&expected),
+                    "w={} sel={}: {:?} must contain {:?}",
+                    width, sel, line, expected
+                );
+                // The fit must be tight: expected was computed for the real
+                // column, so the row must also still hold the RSS value.
+                assert!(line.contains("175B"), "w={} sel={}: {}", width, sel, line);
+            }
+        }
+    }
+
+    #[test]
+    fn rendered_children_show_name_pid_and_command() {
+        let child_line = {
+            let mut app = App::new();
+            app.groups = vec![bridge_group()];
+            app.expanded_group = Some(0);
+            app.group_state.select(Some(1)); // first child row
+            let mut terminal = Terminal::new(TestBackend::new(100, 24)).unwrap();
+            terminal
+                .draw(|f| render_process_table(f, &mut app, f.area()))
+                .unwrap();
+            let buf = terminal.backend().buffer();
+            (0..buf.area.width)
+                .map(|x| buf[(x, 4)].symbol().to_string()) // row after the parent
+                .collect::<String>()
+        };
+        assert!(child_line.contains("├─"), "guide: {}", child_line);
+        assert!(child_line.contains("node"), "name: {}", child_line);
+        assert!(child_line.contains("· 1"), "pid: {}", child_line);
+        assert!(child_line.contains("node serve"), "cmd: {}", child_line);
+    }
+
+    #[test]
+    fn header_shows_active_sort_arrow() {
+        let mut app = App::new();
+        app.groups = vec![bridge_group()];
+        let mut terminal = Terminal::new(TestBackend::new(100, 24)).unwrap();
+        terminal
+            .draw(|f| render_process_table(f, &mut app, f.area()))
+            .unwrap();
+        let buf = terminal.backend().buffer();
+        let header: String = (0..buf.area.width)
+            .map(|x| buf[(x, 1)].symbol().to_string()) // y=1 is the header row
+            .collect();
+        assert!(header.contains("TOTAL ↓"), "default sort is total desc: {}", header);
+        assert!(!header.contains("PROJECT ↓"), "{}", header);
+        assert!(!header.contains("RSS ↓"), "{}", header);
+    }
+
+    #[test]
+    fn long_child_name_keeps_pid_visible() {
+        let mut g = bridge_group();
+        g.processes.insert(
+            0,
+            ProcessMemory::new(56597, "Google Chrome Helper (Renderer)".into(), 40),
+        );
+        let mut app = App::new();
+        app.groups = vec![g];
+        app.expanded_group = Some(0);
+        app.group_state.select(Some(1)); // first child row
+        let mut terminal = Terminal::new(TestBackend::new(100, 24)).unwrap();
+        terminal
+            .draw(|f| render_process_table(f, &mut app, f.area()))
+            .unwrap();
+        let buf = terminal.backend().buffer();
+        let line: String = (0..buf.area.width)
+            .map(|x| buf[(x, 4)].symbol().to_string())
+            .collect();
+        assert!(line.contains("56597"), "pid must survive: {}", line);
+        assert!(line.contains("…"), "name must be clipped, not the pid: {}", line);
+        assert!(!line.contains("(Renderer)"), "full name must be truncated: {}", line);
+    }
+
+    #[test]
+    fn rendered_app_mode_bridge_shows_projects() {
+        let real_home = std::env::var("HOME").unwrap_or_default();
+        let tmp = std::env::temp_dir().join(format!("memo-ui-app-{}", std::process::id()));
+        let a = tmp.join("projA");
+        let b = tmp.join("projB");
+        std::fs::create_dir_all(&a).unwrap();
+        std::fs::create_dir_all(&b).unwrap();
+        std::fs::write(a.join("package.json"), "{}").unwrap();
+        std::fs::write(b.join("Makefile"), "").unwrap();
+        // SAFETY (test): no other running test reads HOME's value.
+        unsafe { std::env::set_var("HOME", &tmp); }
+
+        let proc_in = |pid: i32, dir: &std::path::Path| {
+            let mut p = ProcessMemory::new(pid, "node".into(), 100);
+            p.cwd = dir.to_string_lossy().to_string();
+            p
+        };
+
+        for (procs, expected) in [
+            (vec![proc_in(1, &a)], "~/projA".to_string()),
+            (vec![proc_in(1, &a), proc_in(2, &b)], "2 projects".to_string()),
+        ] {
+            let mut app = App::new();
+            app.group_mode = GroupMode::App;
+            app.groups = vec![crate::group::AppGroup {
+                name: "node".into(),
+                kind: crate::group::GroupKind::App,
+                processes: procs,
+                total_rss: 100,
+                total_swap: 0,
+                thread_count: 1,
+            }];
+            let mut terminal = Terminal::new(TestBackend::new(100, 24)).unwrap();
+            terminal
+                .draw(|f| render_process_table(f, &mut app, f.area()))
+                .unwrap();
+            let buf = terminal.backend().buffer();
+            let line: String = (0..buf.area.width)
+                .map(|x| buf[(x, 3)].symbol().to_string())
+                .collect();
+            assert!(line.contains(&expected), "expected {:?} in {}", expected, line);
+        }
+
+        unsafe { std::env::set_var("HOME", &real_home); }
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
 }

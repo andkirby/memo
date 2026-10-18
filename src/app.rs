@@ -15,7 +15,7 @@ impl RowMap { pub fn new() -> Self { Self::default() } }
 
 // ─── Sort ───────────────────────────────────────────────────────────────────
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SortColumn { Name, Physical, Swap, Total }
 
 // ─── View mode ──────────────────────────────────────────────────────────────
@@ -182,9 +182,27 @@ impl App {
             };
             if self.sort_desc { ord.reverse() } else { ord }
         });
+        for g in &mut self.groups {
+            Self::sort_children(&mut g.processes, &self.sort_column, self.sort_desc);
+        }
     }
 
     // ─── Data updates ──────────────────────────────────────────────────
+
+/// Children share the parent view's active sort key; equal keys tie-break by
+/// ascending pid so ordering is deterministic across refreshes.
+fn sort_children(procs: &mut [ProcessMemory], col: &SortColumn, desc: bool) {
+    procs.sort_by(|a, b| {
+        let mut ord = match col {
+            SortColumn::Name => a.name.cmp(&b.name),
+            SortColumn::Physical => a.rss.cmp(&b.rss),
+            SortColumn::Swap => a.swap.cmp(&b.swap),
+            SortColumn::Total => a.total().cmp(&b.total()),
+        };
+        if desc { ord = ord.reverse(); }
+        ord.then_with(|| a.pid.cmp(&b.pid))
+    });
+}
 
     pub fn set_system_memory(&mut self, mem: SystemMemory) {
         self.system_memory = Some(mem);
@@ -202,6 +220,7 @@ impl App {
         self.total_phys = processes.iter().map(|p| p.rss).sum();
         self.total_swap = processes.iter().map(|p| p.swap).sum();
         self.groups = crate::group::group_processes(processes, self.group_mode);
+        self.sort_groups();
     }
 
     // ─── Health ─────────────────────────────────────────────────────────
@@ -305,5 +324,39 @@ mod tests {
         let mut app = app_with_popup();
         app.dismiss_popup_if_outside(5, 15); // col == x+width — outside
         assert!(!app.detail_view_open, "col == x+width is outside");
+    }
+
+    // ─── Sorting ────────────────────────────────────────────────────
+
+    fn pm(pid: i32, name: &str, rss: u64, swap: u64) -> ProcessMemory {
+        let mut p = ProcessMemory::new(pid, name.to_string(), rss);
+        p.swap = swap;
+        p
+    }
+
+    #[test]
+    fn children_follow_active_sort_with_pid_tiebreak() {
+        let mut procs = vec![
+            pm(1, "node", 100, 0),   // total 100
+            pm(3, "node", 50, 200),  // total 250
+            pm(2, "node", 50, 200),  // total 250 — pid tie-break
+        ];
+        App::sort_children(&mut procs, &SortColumn::Total, true);
+        assert_eq!([procs[0].pid, procs[1].pid, procs[2].pid], [2, 3, 1]);
+        // Ascending direction flips the key but keeps the pid tie-break ascending.
+        App::sort_children(&mut procs, &SortColumn::Total, false);
+        assert_eq!([procs[0].pid, procs[1].pid, procs[2].pid], [1, 2, 3]);
+    }
+
+    #[test]
+    fn recalculate_respects_nondefault_sort() {
+        // Amendment 1: a regroup under a nondefault sort must re-sort parents
+        // too, not fall back to group_processes' internal TOTAL-desc order.
+        let mut app = App::new();
+        app.sort_column = SortColumn::Name;
+        app.sort_desc = false;
+        app.recalculate_from(&[pm(1, "bb", 100, 0), pm(2, "aa", 900, 0)]);
+        assert_eq!(app.groups[0].name, "aa", "parents ordered by active key");
+        assert_eq!(app.groups[0].processes[0].name, "aa");
     }
 }

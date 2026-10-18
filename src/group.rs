@@ -41,15 +41,14 @@ impl AppGroup {
         self.thread_count = self.processes.iter().map(|p| p.threads).sum();
     }
 
-    /// The bridge column — the *other* view's key, so switching views loses no
-    /// information. Public entrypoint uses $HOME.
-    pub fn bridge(&self, mode: GroupMode) -> String {
-        self.bridge_in(mode, &home_dir())
+    /// The bridge column as sorted (family, count) tokens — for width-aware rendering.
+    pub fn bridge_tokens(&self, mode: GroupMode) -> Vec<(String, usize)> {
+        self.bridge_tokens_in(mode, &home_dir())
     }
 
-    fn bridge_in(&self, mode: GroupMode, home: &str) -> String {
+    fn bridge_tokens_in(&self, mode: GroupMode, _home: &str) -> Vec<(String, usize)> {
         match (mode, self.kind) {
-            // Project group → runtime breakdown, e.g. "node:15 bun:3"
+            // Project group → runtime breakdown, e.g. [("node", 15), ("bun", 3)]
             (GroupMode::Project, GroupKind::Project) => {
                 let mut counts: Vec<(String, usize)> = {
                     let mut m: HashMap<String, usize> = HashMap::new();
@@ -59,31 +58,42 @@ impl AppGroup {
                     m.into_iter().collect()
                 };
                 counts.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
-                counts.iter()
-                    .map(|(f, c)| format!("{}:{}", f, c))
-                    .collect::<Vec<_>>()
-                    .join(" ")
+                counts
             }
-            // App group (in either mode) → distinct projects under that app
-            (GroupMode::App, GroupKind::App) => {
-                let mut projs: Vec<String> = Vec::new();
-                for p in &self.processes {
-                    if let Some(r) = project_root_in(&p.cwd, &p.cmdline, home) {
-                        let s = shorten_in(&r, home);
-                        if !projs.contains(&s) {
-                            projs.push(s);
-                        }
+            // Everything else has no token form.
+            _ => Vec::new(),
+        }
+    }
+
+    /// The bridge column — the *other* view's key, so switching views loses no
+    /// information. Public entrypoint uses $HOME.
+    pub fn bridge(&self, mode: GroupMode) -> String {
+        self.bridge_in(mode, &home_dir())
+    }
+
+    fn bridge_in(&self, mode: GroupMode, home: &str) -> String {
+        // App groups keep their human formatting ("3 projects"), not token counts.
+        if mode == GroupMode::App && self.kind == GroupKind::App {
+            let mut projs: Vec<String> = Vec::new();
+            for p in &self.processes {
+                if let Some(r) = project_root_in(&p.cwd, &p.cmdline, home) {
+                    let s = shorten_in(&r, home);
+                    if !projs.contains(&s) {
+                        projs.push(s);
                     }
                 }
-                match projs.len() {
-                    0 => String::new(),
-                    1 => projs[0].clone(),
-                    n => format!("{} projects", n),
-                }
             }
-            // App-fallback group inside Project mode, or any other combo: none.
-            _ => String::new(),
+            return match projs.len() {
+                0 => String::new(),
+                1 => projs[0].clone(),
+                n => format!("{} projects", n),
+            };
         }
+        self.bridge_tokens_in(mode, home)
+            .iter()
+            .map(|(f, c)| format!("{}:{}", f, c))
+            .collect::<Vec<_>>()
+            .join(" ")
     }
 }
 
@@ -352,6 +362,17 @@ mod tests {
         assert_eq!(groups[0].processes.len(), 3);
         // runtime breakdown, count-sorted then name-sorted: bun:1 node:1 zsh:1
         assert_eq!(groups[0].bridge_in(GroupMode::Project, &home), "bun:1 node:1 zsh:1");
+        assert_eq!(groups[0].bridge_tokens_in(GroupMode::Project, &home),
+            vec![("bun".to_string(), 1), ("node".to_string(), 1), ("zsh".to_string(), 1)]);
+    }
+
+    #[test]
+    fn bridge_tokens_empty_for_app_fallback_group() {
+        let home = fake_home();
+        let groups = group_processes_in(&[
+            pm_cwd(1, "Slack Helper (Renderer)", 200, "/nonexistent", ""),
+        ], GroupMode::Project, &home);
+        assert_eq!(groups[0].bridge_tokens_in(GroupMode::Project, &home), Vec::new());
     }
 
     #[test]
