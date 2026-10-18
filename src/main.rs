@@ -26,8 +26,12 @@ use scanner::{ProcessMemory, format_size, get_system_memory};
 use sysinfo::{Pid, System};
 
 #[derive(Parser, Debug)]
-#[command(name = "memo", about = "Quick memory usage analysis")]
+#[command(name = "memo", about = "Quick memory usage analysis", version, disable_version_flag = true)]
 struct Args {
+    /// Print version
+    #[arg(short = 'v', long, action = clap::ArgAction::Version)]
+    version: bool,
+
     /// CLI mode (dump to stdout and exit)
     #[arg(long)]
     cli: bool,
@@ -242,6 +246,9 @@ fn run_tui() -> Result<()> {
                             KeyCode::Char('q') => app.quit(),
                             KeyCode::Up | KeyCode::Char('k') => app.prev_group(),
                             KeyCode::Down | KeyCode::Char('j') => app.next_group(),
+                            // macOS Fn+↑ / Fn+↓ send PageUp / PageDown
+                            KeyCode::PageUp => app.page_up(),
+                            KeyCode::PageDown => app.page_down(),
                             KeyCode::Enter => {
                                 // If on a leaf process (expanded group sub-row), open detail
                                 // If on a group header, toggle expand

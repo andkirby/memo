@@ -259,7 +259,10 @@ fn sort_children(procs: &mut [ProcessMemory], col: &SortColumn, desc: bool) {
     pub fn click_table(&mut self, row: u16, _col: u16) {
         let header_offset = self.table_area.y + 3;
         if row < header_offset { return; }
-        let visual_idx = (row - header_offset) as usize;
+        // The table can be scrolled: a screen row shows item `offset + k`, not
+        // item `k`. Screen row 0 under the header is item `offset`.
+        let screen_idx = (row - header_offset) as usize;
+        let visual_idx = screen_idx + self.group_state.offset();
         if visual_idx >= self.row_map.entries.len() { return; }
         self.group_state.select(Some(visual_idx));
         self.sync_from_visual(visual_idx);
@@ -278,6 +281,30 @@ fn sort_children(procs: &mut [ProcessMemory], col: &SortColumn, desc: bool) {
 
     pub fn scroll_table(&mut self, up: bool) {
         if up { self.prev_group(); } else { self.next_group(); }
+    }
+
+    // ─── Paging ─────────────────────────────────────────────────────────
+
+    /// Visible data rows: area height minus borders (2), header (1) and its
+    /// bottom margin (1). Falls back to 1 before the first render.
+    fn page_size(&self) -> usize {
+        self.table_area.height.saturating_sub(5).max(1) as usize
+    }
+
+    pub fn page_up(&mut self) {
+        let len = self.row_map.entries.len();
+        if len == 0 { return; }
+        let i = self.group_state.selected().unwrap_or(0).saturating_sub(self.page_size());
+        self.group_state.select(Some(i));
+        self.sync_from_visual(i);
+    }
+
+    pub fn page_down(&mut self) {
+        let len = self.row_map.entries.len();
+        if len == 0 { return; }
+        let i = (self.group_state.selected().unwrap_or(0) + self.page_size()).min(len - 1);
+        self.group_state.select(Some(i));
+        self.sync_from_visual(i);
     }
 }
 
@@ -358,5 +385,51 @@ mod tests {
         app.recalculate_from(&[pm(1, "bb", 100, 0), pm(2, "aa", 900, 0)]);
         assert_eq!(app.groups[0].name, "aa", "parents ordered by active key");
         assert_eq!(app.groups[0].processes[0].name, "aa");
+    }
+
+    // ─── Mouse + paging ─────────────────────────────────────────────
+
+    fn app_with_rows(n: usize) -> App {
+        let mut app = App::new();
+        app.table_area = Rect::new(0, 6, 100, 24);
+        app.row_map.entries = (0..n).map(|i| (i, None)).collect();
+        app
+    }
+
+    #[test]
+    fn click_accounts_for_scroll_offset() {
+        let mut app = app_with_rows(30);
+        // Scrolled so item 7 is the first visible data row.
+        *app.group_state.offset_mut() = 7;
+        app.click_table(6 + 3, 10); // first data row on screen
+        assert_eq!(app.selected_process(), Some((7, None)), "click at first visible row selects the displayed item, not item 0");
+        app.click_table(6 + 3 + 2, 10);
+        assert_eq!(app.selected_process(), Some((9, None)));
+    }
+
+    #[test]
+    fn click_ignores_header_and_past_end() {
+        let mut app = app_with_rows(5);
+        app.group_state.select(Some(2));
+        app.click_table(6 + 2, 10); // header/margin rows
+        assert_eq!(app.selected_process(), Some((2, None)), "click above data rows is a no-op");
+        app.click_table(6 + 3 + 50, 10);
+        assert_eq!(app.selected_process(), Some((2, None)), "click past the list is a no-op");
+    }
+
+    #[test]
+    fn paging_moves_by_page_and_clamps() {
+        let mut app = app_with_rows(30);
+        app.group_state.select(Some(0));
+        app.page_down();
+        assert_eq!(app.selected_process(), Some((19, None)), "page_size = 24-5 = 19");
+        app.page_down();
+        assert_eq!(app.selected_process(), Some((29, None)), "clamped to last row");
+        app.page_up();
+        assert_eq!(app.selected_process(), Some((10, None)));
+        app.page_up();
+        assert_eq!(app.selected_process(), Some((0, None)), "clamped to first row");
+        app.page_up();
+        assert_eq!(app.selected_process(), Some((0, None)));
     }
 }

@@ -796,6 +796,34 @@ mod tests {
     }
 
     #[test]
+    fn rendered_click_lands_on_displayed_row_after_scroll() {
+        // 30 groups in a 24-row viewport: selecting item 26 forces a scroll
+        // (offset > 0); a click on the first visible row must land on the
+        // item displayed there (offset + 0), not item 0.
+        let mut app = App::new();
+        app.groups = (0..30)
+            .map(|i| {
+                let mut g = bridge_group();
+                g.name = format!("~/g{}", i);
+                g.total_rss = 1000 - i; // stable total-desc order g0..g29
+                g
+            })
+            .collect();
+        app.group_state.select(Some(26));
+        let area = Rect::new(0, 0, 100, 24);
+        let mut terminal = Terminal::new(TestBackend::new(100, 24)).unwrap();
+        terminal
+            .draw(|f| render_process_table(f, &mut app, f.area()))
+            .unwrap();
+        let offset = app.group_state.offset();
+        assert!(offset > 0, "long list must have scrolled, offset={}", offset);
+
+        app.table_area = area;
+        app.click_table(3, 50); // first data row under the header
+        assert_eq!(app.selected_process().map(|(gi, _)| gi), Some(offset));
+    }
+
+    #[test]
     fn rendered_app_mode_bridge_shows_projects() {
         let real_home = std::env::var("HOME").unwrap_or_default();
         let tmp = std::env::temp_dir().join(format!("memo-ui-app-{}", std::process::id()));
