@@ -18,12 +18,15 @@ pub enum ClickAction {
     OpenDetail,
 }
 
-// ─── Visual row mapping ────────────────────────────────────────────────────
+// ─── Visual row mapping ────────────────────────────────────────────
 
-/// Maps a visual table row index to (group_index, Some(proc_index) or None for group header)
+/// Maps a visual table row index to its identity: (group name, Some(pid))
+/// for a process row or (group name, None) for a group header. Group names
+/// are unique keys; positions shift whenever groups re-sort or expansion
+/// changes — identities do not.
 #[derive(Default)]
 pub struct RowMap {
-    pub entries: Vec<(usize, Option<usize>)>,
+    pub entries: Vec<(String, Option<i32>)>,
 }
 
 impl RowMap { pub fn new() -> Self { Self::default() } }
@@ -66,7 +69,9 @@ pub struct App {
     pub all_processes: Vec<ProcessMemory>,
     pub group_state: TableState,
     pub proc_state: TableState,
-    pub expanded_group: Option<usize>,
+    pub expanded_group: Option<String>,
+    /// Identity of the highlighted row: (group name, Some(pid) | None).
+    pub selected_key: Option<(String, Option<i32>)>,
     pub row_map: RowMap,
     pub table_area: Rect,
     pub sort_column: SortColumn,
@@ -95,6 +100,7 @@ impl App {
             group_state: TableState::default(),
             proc_state: TableState::default(),
             expanded_group: None,
+            selected_key: None,
             row_map: RowMap::new(),
             table_area: Rect::default(),
             sort_column: SortColumn::Total,
@@ -142,29 +148,59 @@ impl App {
     }
 
     fn sync_from_visual(&mut self, visual_idx: usize) {
-        if let Some((gi, pi)) = self.row_map.entries.get(visual_idx) {
-            match pi {
-                Some(pidx) => {
-                    if self.expanded_group != Some(*gi) { self.expanded_group = Some(*gi); }
-                    self.proc_state.select(Some(*pidx));
+        if let Some((name, pid)) = self.row_map.entries.get(visual_idx).cloned() {
+            self.selected_key = Some((name.clone(), pid));
+            match pid {
+                Some(pid) => {
+                    if self.expanded_group.as_deref() != Some(name.as_str())
+                        && let Some(gi) = self.groups.iter().position(|g| g.name == name)
+                        && let Some(pi) = self.groups[gi].processes.iter().position(|p| p.pid == pid)
+                    {
+                        self.proc_state.select(Some(pi));
+                    }
                 }
                 None => { self.proc_state.select(None); }
             }
         }
     }
 
-    pub fn selected_process(&self) -> Option<(usize, Option<usize>)> {
+    pub fn selected_process(&self) -> Option<(String, Option<i32>)> {
         let visual_idx = self.group_state.selected()?;
-        self.row_map.entries.get(visual_idx).copied()
+        self.row_map.entries.get(visual_idx).cloned()
+    }
+
+    /// Resolve the selected identity to current positions
+    /// (group_index, Option<proc_index>). Positions shift on re-sort;
+    /// identities do not.
+    pub fn selected_location(&self) -> Option<(usize, Option<usize>)> {
+        let (name, pid) = self.selected_key.as_ref()?;
+        let gi = self.groups.iter().position(|g| &g.name == name)?;
+        let pi = pid.and_then(|pid| self.groups[gi].processes.iter().position(|p| p.pid == pid));
+        Some((gi, pi))
+    }
+
+    /// Re-position the visual selection on the selected identity's row after
+    /// the row list was rebuilt (re-sort, expansion change, scan refresh).
+    /// Falls back to the current index when the identity no longer exists.
+    pub fn resync_selection(&mut self) {
+        if let Some((name, pid)) = &self.selected_key
+            && let Some(idx) = self
+                .row_map
+                .entries
+                .iter()
+                .position(|e| &e.0 == name && e.1 == *pid)
+        {
+            self.group_state.select(Some(idx));
+        }
     }
 
     pub fn toggle_expand(&mut self) {
-        if let Some((gi, _pi)) = self.selected_process() {
-            if self.expanded_group == Some(gi) {
+        if let Some((name, _pid)) = self.selected_process() {
+            if self.expanded_group.as_deref() == Some(name.as_str()) {
                 self.expanded_group = None;
                 self.proc_state.select(None);
             } else {
-                self.expanded_group = Some(gi);
+                self.expanded_group = Some(name);
                 self.proc_state.select(Some(0));
             }
         }
@@ -260,13 +296,11 @@ fn sort_children(procs: &mut [ProcessMemory], col: &SortColumn, desc: bool) {
     // ─── Actions ────────────────────────────────────────────────────────
 
     pub fn kill_selected(&mut self) {
-        let pid = if let Some((gi, pi)) = self.selected_process() {
-            if let Some(pidx) = pi {
-                self.groups.get(gi).and_then(|g| g.processes.get(pidx)).map(|p| p.pid)
-            } else {
-                self.groups.get(gi).and_then(|g| g.processes.first()).map(|p| p.pid)
-            }
-        } else { None };
+        let pid = match self.selected_location() {
+            Some((gi, Some(pi))) => self.groups.get(gi).and_then(|g| g.processes.get(pi)).map(|p| p.pid),
+            Some((gi, None)) => self.groups.get(gi).and_then(|g| g.processes.first()).map(|p| p.pid),
+            None => None,
+        };
 
         if let Some(pid) = pid {
             let _ = std::process::Command::new("kill").arg("-9").arg(pid.to_string()).output();
@@ -449,7 +483,7 @@ mod tests {
     fn app_with_rows(n: usize) -> App {
         let mut app = App::new();
         app.table_area = Rect::new(0, 6, 100, 24);
-        app.row_map.entries = (0..n).map(|i| (i, None)).collect();
+        app.row_map.entries = (0..n).map(|i| (format!("g{i}"), None)).collect();
         app
     }
 
@@ -459,9 +493,9 @@ mod tests {
         // Scrolled so item 7 is the first visible data row.
         *app.group_state.offset_mut() = 7;
         app.click_table(6 + 3, 10); // first data row on screen
-        assert_eq!(app.selected_process(), Some((7, None)), "click at first visible row selects the displayed item, not item 0");
+        assert_eq!(app.selected_process(), Some(("g7".into(), None)), "click at first visible row selects the displayed item, not item 0");
         app.click_table(6 + 3 + 2, 10);
-        assert_eq!(app.selected_process(), Some((9, None)));
+        assert_eq!(app.selected_process(), Some(("g9".into(), None)));
     }
 
     #[test]
@@ -469,9 +503,9 @@ mod tests {
         let mut app = app_with_rows(5);
         app.group_state.select(Some(2));
         app.click_table(6 + 2, 10); // header/margin rows
-        assert_eq!(app.selected_process(), Some((2, None)), "click above data rows is a no-op");
+        assert_eq!(app.selected_process(), Some(("g2".into(), None)), "click above data rows is a no-op");
         app.click_table(6 + 3 + 50, 10);
-        assert_eq!(app.selected_process(), Some((2, None)), "click past the list is a no-op");
+        assert_eq!(app.selected_process(), Some(("g2".into(), None)), "click past the list is a no-op");
     }
 
     #[test]
@@ -479,15 +513,15 @@ mod tests {
         let mut app = app_with_rows(30);
         app.group_state.select(Some(0));
         app.page_down();
-        assert_eq!(app.selected_process(), Some((19, None)), "page_size = 24-5 = 19");
+        assert_eq!(app.selected_process(), Some(("g19".into(), None)), "page_size = 24-5 = 19");
         app.page_down();
-        assert_eq!(app.selected_process(), Some((29, None)), "clamped to last row");
+        assert_eq!(app.selected_process(), Some(("g29".into(), None)), "clamped to last row");
         app.page_up();
-        assert_eq!(app.selected_process(), Some((10, None)));
+        assert_eq!(app.selected_process(), Some(("g10".into(), None)));
         app.page_up();
-        assert_eq!(app.selected_process(), Some((0, None)), "clamped to first row");
+        assert_eq!(app.selected_process(), Some(("g0".into(), None)), "clamped to first row");
         app.page_up();
-        assert_eq!(app.selected_process(), Some((0, None)));
+        assert_eq!(app.selected_process(), Some(("g0".into(), None)));
     }
 
     // ─── Double-click handling ──────────────────────────────────────
@@ -502,13 +536,13 @@ mod tests {
         // must expand group 1 — the old code skipped the selection update on
         // the second click and toggled the previous selection instead.
         let mut app = app_with_rows(3);
-        app.expanded_group = Some(0);
+        app.expanded_group = Some("g0".into());
         let row1 = 6 + 3 + 1; // group 1's header row (group 0 header + 1 child)
         assert_eq!(app.click(row1, 10, t(0)), ClickAction::Select);
-        assert_eq!(app.selected_process(), Some((1, None)));
+        assert_eq!(app.selected_process(), Some(("g1".into(), None)));
         assert_eq!(app.click(row1, 10, t(100)), ClickAction::ToggleExpand);
-        assert_eq!(app.expanded_group, Some(1), "clicked group toggled");
-        assert_eq!(app.selected_process(), Some((1, None)), "clicked row stays active");
+        assert_eq!(app.expanded_group.as_deref(), Some("g1"), "clicked group toggled");
+        assert_eq!(app.selected_process(), Some(("g1".into(), None)), "clicked row stays active");
     }
 
     #[test]
@@ -517,9 +551,9 @@ mod tests {
         // click at the same SCREEN position is a different row — it must not
         // toggle.
         let mut app = app_with_rows(5);
-        app.expanded_group = Some(0); // rows below shift by group 0's children
+        app.expanded_group = Some("g0".into()); // rows below shift by group 0's children
         app.click(6 + 3 + 3, 10, t(0)); // select row 3 (group 3)
-        assert_eq!(app.selected_process(), Some((3, None)));
+        assert_eq!(app.selected_process(), Some(("g3".into(), None)));
         // Group 0 collapses and the table re-renders: one row disappears.
         app.expanded_group = None;
         app.row_map.entries.remove(1);
@@ -531,12 +565,12 @@ mod tests {
     #[test]
     fn double_click_on_child_row_requests_detail() {
         let mut app = app_with_rows(3);
-        app.expanded_group = Some(0);
-        app.row_map.entries.insert(1, (0, Some(0))); // child under group 0
+        app.expanded_group = Some("g0".into());
+        app.row_map.entries.insert(1, ("g0".into(), Some(0))); // child under group 0
         let child_row = 6 + 3 + 1;
         app.click(child_row, 10, t(0));
         assert_eq!(app.click(child_row, 10, t(100)), ClickAction::OpenDetail);
-        assert_eq!(app.expanded_group, Some(0), "detail double-click must not collapse");
+        assert_eq!(app.expanded_group.as_deref(), Some("g0"), "detail double-click must not collapse");
     }
 
     #[test]
@@ -546,9 +580,43 @@ mod tests {
         app.click(row0, 10, t(0));
         assert_eq!(app.click(row0, 10, t(50)), ClickAction::ToggleExpand);
         // The re-render inserts group 0's child row (layout changed).
-        app.row_map.entries.insert(1, (0, Some(0)));
+        app.row_map.entries.insert(1, ("g0".into(), Some(0)));
         // Third fast click is a plain select, not another toggle.
         assert_eq!(app.click(row0, 10, t(100)), ClickAction::Select);
-        assert_eq!(app.expanded_group, Some(0));
+        assert_eq!(app.expanded_group.as_deref(), Some("g0"));
+    }
+
+    #[test]
+    fn selection_follows_group_after_reshuffle() {
+        // The whole point of identity-based selection: groups re-sort on every
+        // scan; after the row list is rebuilt, the highlight must stay on the
+        // same GROUP, not the same physical row.
+        let mut app = app_with_rows(3);
+        app.selected_key = Some(("g2".into(), None));
+        app.group_state.select(Some(2)); // g2's current physical row
+        app.resync_selection();
+        // Refresh re-sorts: g2 moves to the front.
+        app.row_map.entries = vec!["g2".into(), "g0".into(), "g1".into()]
+            .into_iter()
+            .map(|n| (n, None))
+            .collect();
+        app.resync_selection();
+        assert_eq!(app.group_state.selected(), Some(0), "highlight follows g2 to its new row");
+        assert_eq!(app.selected_process().map(|(n, _)| n), Some("g2".into()));
+    }
+
+    #[test]
+    fn enter_toggles_clicked_group_identity_only() {
+        // Regression for the reported bug: with "com" expanded, Enter/click on
+        // "bb" must toggle bb and never touch com.
+        let mut app = app_with_rows(3);
+        app.expanded_group = Some("com".into());
+        app.selected_key = Some(("bb".into(), None));
+        app.group_state.select(Some(1)); // bb's header row
+        app.row_map.entries = vec![("com".into(), None), ("bb".into(), None), ("x".into(), None)];
+        app.toggle_expand();
+        assert_eq!(app.expanded_group.as_deref(), Some("bb"));
+        app.toggle_expand();
+        assert_eq!(app.expanded_group, None);
     }
 }

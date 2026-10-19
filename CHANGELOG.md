@@ -4,6 +4,18 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [0.3.2] - 2026-10-19
+
+### Fixed
+- **Selection and expansion now follow groups, not positions.** The selected
+  row and the expanded group were stored as list indices; every scan refresh
+  re-sorts groups, so the highlight stayed at the same physical row while
+  groups moved under it — clicking a group or pressing Enter could act on a
+  different one (the reported "com.apple collapses, bb opens" jump). Selection
+  and expansion are now identity-based (group name + pid) and re-anchored on
+  every rebuild: the highlight follows the clicked/selected group across
+  re-sorts, and Enter toggles exactly the group under the cursor.
+
 ## [0.3.1] - 2026-10-18
 
 ### Fixed

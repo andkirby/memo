@@ -287,7 +287,7 @@ fn run_tui() -> Result<()> {
                             KeyCode::Enter => {
                                 // If on a leaf process (expanded group sub-row), open detail
                                 // If on a group header, toggle expand
-                                if let Some((gi, pi)) = app.selected_process() {
+                                if let Some((_name, pi)) = app.selected_process() {
                                     if pi.is_some() {
                                         // On a sub-process — open detail
                                         app.detail_view_open = true;
@@ -371,7 +371,7 @@ fn run_tui() -> Result<()> {
 
 /// Open detail popup — reads memory from already-scanned data, fetches metadata in background
 fn show_detail(app: &App, tx: &mpsc::Sender<ScanEvent>) {
-    let target = if let Some((gi, pi)) = app.selected_process() {
+    let target = if let Some((gi, pi)) = app.selected_location() {
         if let Some(pidx) = pi {
             app.groups.get(gi).and_then(|g| g.processes.get(pidx))
         } else {

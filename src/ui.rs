@@ -219,15 +219,14 @@ fn render_process_table(f: &mut Frame, app: &mut App, area: Rect) {
     });
     let header = Row::new(header_cells).height(1).bottom_margin(1);
 
-    let expanded = app.expanded_group;
     let cols = table_columns(area, app.group_state.selected().is_some());
     let bridge_width = cols[2].width as usize;
     let name_width = cols[0].width as usize;
 
     let mut rows: Vec<Row> = Vec::new();
-    let mut row_map: Vec<(usize, Option<usize>)> = Vec::new();
-    for (gi, group) in app.groups.iter().enumerate() {
-        let is_expanded = expanded == Some(gi);
+    let mut row_map: Vec<(String, Option<i32>)> = Vec::new();
+    for group in app.groups.iter() {
+        let is_expanded = app.expanded_group.as_deref() == Some(group.name.as_str());
         let prefix = if is_expanded { "▾ " } else { "▸ " };
         // Expanded parent is highlighted; collapsed parents are bold so the
         // hierarchy reads even before any child rows are shown.
@@ -254,13 +253,13 @@ fn render_process_table(f: &mut Frame, app: &mut App, area: Rect) {
         ]).height(1);
 
         rows.push(row);
-        row_map.push((gi, None));  // group header row
+        row_map.push((group.name.clone(), None));  // group header row
 
         // If expanded, show child processes
         if is_expanded {
             let n = group.processes.len();
-            for (pi, proc) in group.processes.iter().enumerate() {
-                let guide = if pi + 1 == n { "└─ " } else { "├─ " };
+            for (_pi, proc) in group.processes.iter().enumerate() {
+                let guide = if _pi + 1 == n { "└─ " } else { "├─ " };
                 // Reserve room for the pid suffix so long names clip, not the pid.
                 let pid_span = format!(" · {}", proc.pid);
                 let name_budget = name_width
@@ -281,13 +280,16 @@ fn render_process_table(f: &mut Frame, app: &mut App, area: Rect) {
                     right(format_size(proc.total()), total_color(proc.total())),
                 ]).height(1);
                 rows.push(child_row);
-                row_map.push((gi, Some(pi)));  // sub-process row
+                row_map.push((group.name.clone(), Some(proc.pid)));  // sub-process row
             }
         }
     }
 
-    // Store the row map so main.rs can use it for navigation
+    // Store the row map so main.rs can use it for navigation, then re-anchor
+    // the visual selection on the selected identity — groups re-sort on every
+    // scan, so a raw index can silently point at a different row.
     app.row_map.entries = row_map;
+    app.resync_selection();
 
     let widths = TABLE_WIDTHS;
 
@@ -696,7 +698,7 @@ mod tests {
     fn rendered_first_row(width: u16, with_selection: bool) -> String {
         let mut app = App::new();
         app.groups = vec![bridge_group()];
-        app.expanded_group = Some(0);
+        app.expanded_group = Some("~/demo".into());
         if with_selection {
             app.group_state.select(Some(0));
         }
@@ -737,7 +739,7 @@ mod tests {
         let child_line = {
             let mut app = App::new();
             app.groups = vec![bridge_group()];
-            app.expanded_group = Some(0);
+            app.expanded_group = Some("~/demo".into());
             app.group_state.select(Some(1)); // first child row
             let mut terminal = Terminal::new(TestBackend::new(100, 24)).unwrap();
             terminal
@@ -780,7 +782,7 @@ mod tests {
         );
         let mut app = App::new();
         app.groups = vec![g];
-        app.expanded_group = Some(0);
+        app.expanded_group = Some("~/demo".into());
         app.group_state.select(Some(1)); // first child row
         let mut terminal = Terminal::new(TestBackend::new(100, 24)).unwrap();
         terminal
@@ -820,7 +822,39 @@ mod tests {
 
         app.table_area = area;
         app.click_table(3, 50); // first data row under the header
-        assert_eq!(app.selected_process().map(|(gi, _)| gi), Some(offset));
+        assert_eq!(app.selected_process().map(|(name, _)| name), Some(format!("~/g{offset}")));
+    }
+
+    #[test]
+    fn rendered_resort_keeps_highlight_on_clicked_group() {
+        // The reported bug: click bb while com is expanded; a scan refresh
+        // re-sorts groups; the highlight used to stay at the old physical
+        // row and the expansion jumped to whatever landed there. Identity-
+        // based selection must keep the highlight on bb and expansion on com.
+        let mut com = bridge_group();
+        com.name = "~/com".into();
+        com.processes.insert(0, ProcessMemory::new(1, "worker".into(), 10));
+        let mut bb = bridge_group();
+        bb.name = "~/bb".into();
+        let mut app = App::new();
+        app.groups = vec![com, bb];
+        app.expanded_group = Some("~/com".into());
+        app.group_state.select(Some(0));
+        let area = Rect::new(0, 0, 100, 24);
+        let mut terminal = Terminal::new(TestBackend::new(100, 24)).unwrap();
+        terminal.draw(|f| render_process_table(f, &mut app, f.area())).unwrap();
+
+        // Click bb's header: com = 1 header + 4 children → bb at data row 5.
+        app.table_area = area;
+        app.click(3 + 5, 50, std::time::Instant::now());
+        assert_eq!(app.selected_process().map(|(n, _)| n), Some("~/bb".into()));
+
+        // Refresh re-sorts: bb (bigger total) jumps above com.
+        app.groups.reverse();
+        terminal.draw(|f| render_process_table(f, &mut app, f.area())).unwrap();
+        assert_eq!(app.group_state.selected(), Some(0), "highlight follows bb to its new row");
+        assert_eq!(app.selected_process().map(|(n, _)| n), Some("~/bb".into()));
+        assert_eq!(app.expanded_group.as_deref(), Some("~/com"), "expansion follows com, not the position");
     }
 
     #[test]
