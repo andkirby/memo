@@ -4,6 +4,17 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [0.3.1] - 2026-10-18
+
+### Fixed
+- **Mouse clicks no longer toggle the wrong group.** The second click of a
+  double-click skipped the selection update, so after rows shifted (a group
+  collapsed/expanded above, or a periodic re-sort) the toggle acted on the
+  previous selection and the highlight landed beside the clicked row. Every
+  click now selects the clicked row first, double-clicks toggle exactly the
+  clicked group, and double-click tracking resets whenever the table layout
+  changes.
+
 ## [0.3.0] - 2026-10-18
 
 ### Added

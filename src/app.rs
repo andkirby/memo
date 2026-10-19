@@ -2,6 +2,21 @@ use crate::group::{AppGroup, GroupMode};
 use crate::scanner::{ProcessMemory, SystemMemory};
 use ratatui::layout::Rect;
 use ratatui::widgets::TableState;
+use std::time::{Duration, Instant};
+
+/// Two clicks on the same spot within this window count as a double-click.
+const DOUBLE_CLICK_MS: u64 = 400;
+
+/// What a left-click asks the caller to do after App updated its state.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ClickAction {
+    /// Selection moved to the clicked row; nothing further to do.
+    Select,
+    /// Double-click on a group header — expansion was toggled.
+    ToggleExpand,
+    /// Double-click on a process row — open the detail popup.
+    OpenDetail,
+}
 
 // ─── Visual row mapping ────────────────────────────────────────────────────
 
@@ -56,6 +71,7 @@ pub struct App {
     pub table_area: Rect,
     pub sort_column: SortColumn,
     pub sort_desc: bool,
+    pub last_click: Option<(u16, u16, Instant, usize)>,
     pub is_loading: bool,
     pub scan_progress: Option<(usize, usize)>,
     pub deep_scan_progress: Option<(usize, usize)>,
@@ -83,6 +99,7 @@ impl App {
             table_area: Rect::default(),
             sort_column: SortColumn::Total,
             sort_desc: true,
+            last_click: None,
             is_loading: false,
             scan_progress: None,
             deep_scan_progress: None,
@@ -279,6 +296,46 @@ fn sort_children(procs: &mut [ProcessMemory], col: &SortColumn, desc: bool) {
         }
     }
 
+    // ─── Mouse clicks ───────────────────────────────────────────────────
+
+    /// Handle one left-click at the given terminal position. The clicked row
+    /// ALWAYS becomes the selected row — even on the second click of a
+    /// double — so the toggle below acts on exactly the group under the
+    /// cursor, never on a stale selection.
+    pub fn click(&mut self, row: u16, col: u16, now: Instant) -> ClickAction {
+        self.click_table(row, col);
+
+        // The table is re-rendered between clicks, so any layout change
+        // (expansion toggle, periodic re-sort) changes the row count. A
+        // stored click from a different layout is stale: the same screen
+        // position now shows a different row, and it must not read as double.
+        let rows = self.row_map.entries.len();
+        let is_double = self
+            .last_click
+            .is_some_and(|(r, c, t, rows_at_click)| {
+                r == row
+                    && c == col
+                    && rows_at_click == rows
+                    && now.duration_since(t) < Duration::from_millis(DOUBLE_CLICK_MS)
+            });
+
+        let action = if is_double {
+            match self.selected_process() {
+                Some((_gi, Some(_pid))) => ClickAction::OpenDetail,
+                Some((_gi, None)) => {
+                    self.toggle_expand();
+                    ClickAction::ToggleExpand
+                }
+                None => ClickAction::Select,
+            }
+        } else {
+            ClickAction::Select
+        };
+
+        self.last_click = Some((row, col, now, rows));
+        action
+    }
+
     pub fn scroll_table(&mut self, up: bool) {
         if up { self.prev_group(); } else { self.next_group(); }
     }
@@ -431,5 +488,67 @@ mod tests {
         assert_eq!(app.selected_process(), Some((0, None)), "clamped to first row");
         app.page_up();
         assert_eq!(app.selected_process(), Some((0, None)));
+    }
+
+    // ─── Double-click handling ──────────────────────────────────────
+
+    fn t(ms: u64) -> Instant {
+        Instant::now() - Duration::from_millis(10_000) + Duration::from_millis(ms)
+    }
+
+    #[test]
+    fn double_click_expands_the_clicked_group_not_a_stale_selection() {
+        // Regression: with group 0 expanded, double-clicking group 1's header
+        // must expand group 1 — the old code skipped the selection update on
+        // the second click and toggled the previous selection instead.
+        let mut app = app_with_rows(3);
+        app.expanded_group = Some(0);
+        let row1 = 6 + 3 + 1; // group 1's header row (group 0 header + 1 child)
+        assert_eq!(app.click(row1, 10, t(0)), ClickAction::Select);
+        assert_eq!(app.selected_process(), Some((1, None)));
+        assert_eq!(app.click(row1, 10, t(100)), ClickAction::ToggleExpand);
+        assert_eq!(app.expanded_group, Some(1), "clicked group toggled");
+        assert_eq!(app.selected_process(), Some((1, None)), "clicked row stays active");
+    }
+
+    #[test]
+    fn expansion_change_invalidates_double_click_tracking() {
+        // Regression: after rows shift (expansion change + re-render), a fast
+        // click at the same SCREEN position is a different row — it must not
+        // toggle.
+        let mut app = app_with_rows(5);
+        app.expanded_group = Some(0); // rows below shift by group 0's children
+        app.click(6 + 3 + 3, 10, t(0)); // select row 3 (group 3)
+        assert_eq!(app.selected_process(), Some((3, None)));
+        // Group 0 collapses and the table re-renders: one row disappears.
+        app.expanded_group = None;
+        app.row_map.entries.remove(1);
+        let action = app.click(6 + 3 + 3, 10, t(100));
+        assert_eq!(action, ClickAction::Select, "shifted row must not read as double");
+        assert_eq!(app.expanded_group, None, "no accidental toggle");
+    }
+
+    #[test]
+    fn double_click_on_child_row_requests_detail() {
+        let mut app = app_with_rows(3);
+        app.expanded_group = Some(0);
+        app.row_map.entries.insert(1, (0, Some(0))); // child under group 0
+        let child_row = 6 + 3 + 1;
+        app.click(child_row, 10, t(0));
+        assert_eq!(app.click(child_row, 10, t(100)), ClickAction::OpenDetail);
+        assert_eq!(app.expanded_group, Some(0), "detail double-click must not collapse");
+    }
+
+    #[test]
+    fn rapid_third_click_does_not_oscillate() {
+        let mut app = app_with_rows(3);
+        let row0 = 6 + 3;
+        app.click(row0, 10, t(0));
+        assert_eq!(app.click(row0, 10, t(50)), ClickAction::ToggleExpand);
+        // The re-render inserts group 0's child row (layout changed).
+        app.row_map.entries.insert(1, (0, Some(0)));
+        // Third fast click is a plain select, not another toggle.
+        assert_eq!(app.click(row0, 10, t(100)), ClickAction::Select);
+        assert_eq!(app.expanded_group, Some(0));
     }
 }

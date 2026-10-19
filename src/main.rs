@@ -232,7 +232,6 @@ fn run_tui() -> Result<()> {
 
     let tick_rate = Duration::from_millis(100);
     let mut last_tick = Instant::now();
-    let mut last_click: Option<(u16, u16, Instant)> = None; // (row, col, time) for double-click
 
     loop {
         terminal.draw(|f| ui::ui(f, &mut app))?;
@@ -254,26 +253,15 @@ fn run_tui() -> Result<()> {
                         if app.detail_view_open {
                             app.dismiss_popup_if_outside(mouse.row, mouse.column);
                         } else {
-                            // Detect double-click (same row within 400ms)
-                            let now = Instant::now();
-                            let is_double = last_click.map_or(false, |(r, _c, t)| {
-                                r == mouse.row && now.duration_since(t) < Duration::from_millis(400)
-                            });
-                            last_click = Some((mouse.row, mouse.column, now));
-
-                            if is_double {
-                                // Double-click on sub-process = open detail
-                                if let Some((_gi, pi)) = app.selected_process() {
-                                    if pi.is_some() {
-                                        app.detail_view_open = true;
-                                        app.current_detail = None;
-                                        show_detail(&app, &tx);
-                                    } else {
-                                        app.toggle_expand();
-                                    }
-                                }
-                            } else {
-                                app.click_table(mouse.row, mouse.column);
+                            // App::click always moves the selection to the
+                            // clicked row (even on a double's second click) and
+                            // toggles exactly the group under the cursor.
+                            if app.click(mouse.row, mouse.column, Instant::now())
+                                == app::ClickAction::OpenDetail
+                            {
+                                app.detail_view_open = true;
+                                app.current_detail = None;
+                                show_detail(&app, &tx);
                             }
                         }
                     }
