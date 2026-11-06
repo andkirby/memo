@@ -30,19 +30,19 @@ error contract is [Agent inspection](docs/agent-inspection.md).
 
 ```
 ┌─────────────┐
-│  sysinfo     │──── all processes (pid, name, cmdline, RSS, cwd) ─┐
-└─────────────┘                                                    │
-                                                                   ▼
-┌─────────────┐                                         ┌──────────────────┐
+│  sysinfo    │──── all processes (pid, name, cmdline, RSS, cwd) ─┐
+└─────────────┘                                                   │
+                                                                  ▼
+┌─────────────┐                                          ┌──────────────────┐
 │  footprint  │──── swap for PIDs with RSS≥5MB ────────► │ ProcessMemory    │
 └─────────────┘    (parallel batches of 20×4)            │ {rss, swap, cwd} │
 ┌─────────────┐    (one call, ≈0.14s)                    └──────┬───────────┘
 │  lsof -d cwd│──── backfills cwd where sysinfo omits ──►       │
 └─────────────┘                                                 │
-┌─────────────┐                                                 │
+┌──────────────┐                                                │
 │  vm_stat +   │──── system RAM breakdown ──────────────────────┤
 │  sysctl      │    (App, Wired, Compressed, Cache, Swap)       │
-└─────────────┘                                                 │
+└──────────────┘                                                │
                                                                 ▼
                                                   ┌────────────────────────┐
                                                   │ group_processes(mode)  │
