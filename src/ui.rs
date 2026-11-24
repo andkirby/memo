@@ -50,6 +50,7 @@ pub fn ui(f: &mut Frame, app: &mut App) {
 
 fn render_overview(f: &mut Frame, app: &mut App, area: Rect) {
     let block = Block::default()
+        .title(concat!(" Memo v", env!("CARGO_PKG_VERSION"), " "))
         .borders(Borders::ALL)
         .border_style(Style::default().fg(Color::DarkGray))
         .style(Style::default().bg(Color::Reset));

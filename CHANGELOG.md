@@ -4,6 +4,22 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [0.4.0] - 2026-11-24
+
+### Added
+
+- The TUI header shows the running Memo version.
+- `memo --cli --quick` ranks apps or projects by resident memory without
+  running `footprint`.
+
+### Fixed
+
+- App and project CLI views honor the requested sort order.
+- Process memory labels distinguish compressed or swapped pages from system
+  disk swap.
+- The TUI shows the selected process name and PID before asking for
+  force-quit confirmation. This requires the macOS audit-token signal API.
+
 ## [0.3.2] - 2026-10-19
 
 ### Fixed
