@@ -1,3 +1,4 @@
+use crate::termination::ProcessIdentity;
 use std::collections::HashMap;
 use std::process::Command;
 
@@ -10,6 +11,7 @@ use std::process::Command;
 pub struct ProcessMemory {
     pub pid: i32,
     pub name: String,
+    pub termination_identity: Option<ProcessIdentity>, // recorded for TUI termination
     pub cmdline: String,
     pub cwd: String,    // from sysinfo (+ lsof fallback) — used for project grouping
     pub rss: u64,       // resident memory from sysinfo
@@ -26,6 +28,7 @@ impl ProcessMemory {
         Self {
             pid,
             name,
+            termination_identity: None,
             cmdline: String::new(),
             cwd: String::new(),
             rss,

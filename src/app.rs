@@ -1,8 +1,10 @@
 use crate::group::{AppGroup, GroupMode};
 use crate::scanner::{ProcessMemory, SystemMemory};
+use crate::termination::ProcessIdentity;
 use ratatui::layout::Rect;
 use ratatui::widgets::TableState;
 use std::cmp::Ordering;
+use std::io;
 use std::time::{Duration, Instant};
 
 /// Two clicks on the same spot within this window count as a double-click.
@@ -82,6 +84,17 @@ pub struct ProcessDetail {
     pub parent_cmd: Option<String>,
 }
 
+pub struct TerminationTarget {
+    pub name: String,
+    identity: ProcessIdentity,
+}
+
+impl TerminationTarget {
+    pub fn pid(&self) -> i32 {
+        self.identity.pid()
+    }
+}
+
 // ─── App state ──────────────────────────────────────────────────────────────
 
 pub struct App {
@@ -104,6 +117,8 @@ pub struct App {
     pub scan_progress: Option<(usize, usize)>,
     pub deep_scan_progress: Option<(usize, usize)>,
     pub status_message: Option<String>,
+    pub pending_termination: Option<TerminationTarget>,
+    pub termination_status: Option<String>,
     pub detail_view_open: bool,
     pub current_detail: Option<ProcessDetail>,
     pub popup_area: Option<Rect>,   // Some while the detail popup is on screen
@@ -133,6 +148,8 @@ impl App {
             scan_progress: None,
             deep_scan_progress: None,
             status_message: None,
+            pending_termination: None,
+            termination_status: None,
             detail_view_open: false,
             current_detail: None,
             popup_area: None,
@@ -305,16 +322,57 @@ fn sort_children(procs: &mut [ProcessMemory], col: &SortColumn, desc: bool) {
 
     // ─── Actions ────────────────────────────────────────────────────────
 
-    pub fn kill_selected(&mut self) {
-        let pid = match self.selected_location() {
-            Some((gi, Some(pi))) => self.groups.get(gi).and_then(|g| g.processes.get(pi)).map(|p| p.pid),
-            Some((gi, None)) => self.groups.get(gi).and_then(|g| g.processes.first()).map(|p| p.pid),
-            None => None,
+    pub fn request_termination(&mut self) {
+        self.termination_status = None;
+        let Some((group_name, pid)) = self.selected_process() else {
+            return;
+        };
+        let Some(pid) = pid else {
+            if self.expanded_group.as_deref() != Some(group_name.as_str()) {
+                self.toggle_expand();
+            }
+            self.selected_key = Some((group_name, None));
+            return;
         };
 
-        if let Some(pid) = pid {
-            let _ = std::process::Command::new("kill").arg("-9").arg(pid.to_string()).output();
+        let target = self
+            .groups
+            .iter()
+            .find(|group| group.name == group_name)
+            .and_then(|group| group.processes.iter().find(|process| process.pid == pid));
+        if let Some(process) = target
+            && let Some(identity) = process.termination_identity
+            && identity.pid() == pid
+        {
+            self.pending_termination = Some(TerminationTarget {
+                name: process.name.clone(),
+                identity,
+            });
+        } else {
+            self.termination_status = Some(format!("Cannot verify PID {pid} for termination."));
         }
+    }
+
+    pub fn cancel_termination(&mut self) {
+        self.pending_termination = None;
+        self.termination_status = Some("Termination canceled.".into());
+    }
+
+    pub fn confirm_termination(
+        &mut self,
+        send: impl FnOnce(ProcessIdentity) -> io::Result<()>,
+    ) {
+        let Some(target) = self.pending_termination.take() else {
+            return;
+        };
+        let pid = target.pid();
+        self.termination_status = Some(match send(target.identity) {
+            Ok(()) => format!("SIGKILL sent to PID {pid}."),
+            Err(error) if error.raw_os_error() == Some(libc::ESRCH) => {
+                format!("PID {pid} exited or changed identity.")
+            }
+            Err(error) => format!("SIGKILL to PID {pid} failed: {error}"),
+        });
     }
 
     pub fn click_table(&mut self, row: u16, _col: u16) {

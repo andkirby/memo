@@ -305,7 +305,7 @@ pub fn run(args: InspectArgs) -> i32 {
         Err(e) => return fail(&e),
     };
 
-    let mut processes = crate::collect_processes();
+    let mut processes = crate::collect_processes(false);
     if processes.is_empty() {
         return fail(&InspectError::ScanFailed);
     }

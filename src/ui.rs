@@ -1,4 +1,4 @@
-use crate::app::{App, SortColumn};
+use crate::app::{App, SortColumn, TerminationTarget};
 use crate::group::GroupMode;
 use crate::scanner::format_size;
 use ratatui::{
@@ -41,7 +41,9 @@ pub fn ui(f: &mut Frame, app: &mut App) {
     app.table_area = chunks[1];
     render_status(f, app, chunks[2]);
 
-    if app.detail_view_open {
+    if let Some(target) = &app.pending_termination {
+        render_termination_popup(f, target);
+    } else if app.detail_view_open {
         render_detail_popup(f, app);
     }
 }
@@ -437,10 +439,10 @@ fn render_status(f: &mut Frame, app: &mut App, area: Rect) {
 
     let controls = vec![
         Line::from(vec![
+            Span::styled("x", keys), Span::styled(" Expand/confirm  ", desc),
             Span::styled("↑↓", keys), Span::styled(" Navigate  ", desc),
             Span::styled("Enter", keys), Span::styled(" Expand  ", desc),
-            Span::styled("D", keys), Span::styled(" Detail  ", desc),
-            Span::styled("X", keys), Span::styled(" Kill  ", desc),
+            Span::styled("D", keys), Span::styled(" Detail", desc),
         ]),
         Line::from(vec![
             Span::styled("Tab", keys), Span::styled(" App/Project  ", desc),
@@ -459,7 +461,13 @@ fn render_status(f: &mut Frame, app: &mut App, area: Rect) {
     );
 
     // Status / scan progress
-    if let Some((current, total)) = app.deep_scan_progress {
+    if let Some(message) = &app.termination_status {
+        let status = Paragraph::new(message.as_str())
+            .wrap(Wrap { trim: true })
+            .style(Style::default().fg(Color::Yellow))
+            .block(Block::default().borders(Borders::ALL).title("Status"));
+        f.render_widget(status, chunks[1]);
+    } else if let Some((current, total)) = app.deep_scan_progress {
         let pct = if total > 0 { ((current as f64 / total as f64) * 100.0) as u16 } else { 0 };
         let spinner = SPINNER[app.spinner_idx % SPINNER.len()];
         let gauge = Gauge::default()
@@ -482,6 +490,30 @@ fn render_status(f: &mut Frame, app: &mut App, area: Rect) {
             .block(Block::default().borders(Borders::ALL).title("Status"));
         f.render_widget(p, chunks[1]);
     }
+}
+
+fn render_termination_popup(f: &mut Frame, target: &TerminationTarget) {
+    let screen = f.area();
+    let width = screen.width.min(64);
+    let height = screen.height.min(6);
+    let area = Rect::new(
+        screen.x + (screen.width - width) / 2,
+        screen.y + (screen.height - height) / 2,
+        width,
+        height,
+    );
+    f.render_widget(Clear, area);
+    let block = Block::default()
+        .title(" Send SIGKILL? ")
+        .borders(Borders::ALL)
+        .style(Style::default().bg(Color::Black));
+    let name = target.name.replace(|character: char| character.is_control(), "�");
+    let lines = vec![
+        Line::from(truncate_ellipsis(&name, usize::from(width.saturating_sub(2)))),
+        Line::from(format!("PID {}", target.pid())),
+        Line::from("y confirm  ·  n / Esc cancel"),
+    ];
+    f.render_widget(Paragraph::new(lines).block(block), area);
 }
 
 fn render_detail_popup(f: &mut Frame, app: &mut App) {

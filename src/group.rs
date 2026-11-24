@@ -310,7 +310,7 @@ mod tests {
     fn pm_cwd(pid: i32, name: &str, rss: u64, cwd: &str, cmdline: &str) -> ProcessMemory {
         ProcessMemory {
             pid, name: name.into(), cmdline: cmdline.into(), cwd: cwd.into(),
-            rss, compressed_or_swapped: 0, threads: 1,
+            termination_identity: None, rss, compressed_or_swapped: 0, threads: 1,
         }
     }
 

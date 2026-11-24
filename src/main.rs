@@ -3,7 +3,11 @@ mod footprint;
 mod group;
 mod inspect;
 mod scanner;
+mod termination;
 mod ui;
+
+#[cfg(test)]
+mod termination_tests;
 
 use std::{
     collections::HashMap,
@@ -18,13 +22,17 @@ use anyhow::Result;
 use app::{App, ProcessDetail, SortColumn};
 use clap::{CommandFactory, Parser, Subcommand, error::ErrorKind};
 use crossterm::{
-    event::{self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, MouseEvent, MouseEventKind},
+    event::{
+        self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEvent, KeyEventKind,
+        KeyModifiers, MouseEventKind,
+    },
     execute,
     terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
 };
 use ratatui::{Terminal, backend::CrosstermBackend};
 use scanner::{ProcessMemory, format_size, get_system_memory};
 use sysinfo::{Pid, System};
+use termination::ProcessIdentity;
 
 #[derive(Parser, Debug)]
 #[command(name = "memo", about = "Quick memory usage analysis", version, disable_version_flag = true,
@@ -159,7 +167,7 @@ fn run_cli(args: Args, sort: SortColumn) -> io::Result<()> {
 
     // Collect processes via sysinfo
     writeln!(out, "Scanning processes...")?;
-    let mut processes = collect_processes();
+    let mut processes = collect_processes(false);
 
     if args.quick {
         writeln!(out, "RSS-only process scan.")?;
@@ -291,7 +299,7 @@ fn run_tui() -> Result<()> {
 
         if crossterm::event::poll(timeout)? && let Ok(ev) = event::read() {
             match ev {
-                Event::Mouse(mouse) => match mouse.kind {
+                Event::Mouse(mouse) if app.pending_termination.is_none() => match mouse.kind {
                     MouseEventKind::ScrollUp => {
                         if !app.detail_view_open { app.scroll_table(true); }
                     }
@@ -321,6 +329,9 @@ fn run_tui() -> Result<()> {
                     }
                     _ => {}
                 },
+                Event::Key(key)
+                    if !app.detail_view_open
+                        && handle_termination_key(&mut app, key, termination::send_sigkill) => {}
                 Event::Key(key) => {
                     if app.detail_view_open {
                         match key.code {
@@ -358,6 +369,7 @@ fn run_tui() -> Result<()> {
                             KeyCode::Char('r') => {
                                 if !app.is_loading {
                                     app.is_loading = true;
+                                    app.termination_status = None;
                                     app.groups.clear();
                                     app.all_processes.clear();
                                     app.expanded_group = None;
@@ -365,7 +377,6 @@ fn run_tui() -> Result<()> {
                                     thread::spawn(move || perform_scan(tx_scan));
                                 }
                             }
-                            KeyCode::Char('x') => app.kill_selected(),
                             KeyCode::Char('t') => { app.sort_column = SortColumn::Total; app.sort_desc = true; app.sort_groups(); }
                             KeyCode::Char('p') => { app.sort_column = SortColumn::Physical; app.sort_desc = true; app.sort_groups(); }
                             KeyCode::Char('s') => { app.sort_column = SortColumn::CompressedOrSwapped; app.sort_desc = true; app.sort_groups(); }
@@ -418,6 +429,29 @@ fn run_tui() -> Result<()> {
     execute!(terminal.backend_mut(), LeaveAlternateScreen, DisableMouseCapture)?;
     terminal.show_cursor()?;
     Ok(())
+}
+
+fn handle_termination_key(
+    app: &mut App,
+    key: KeyEvent,
+    send: impl FnOnce(ProcessIdentity) -> io::Result<()>,
+) -> bool {
+    let plain_press = key.kind == KeyEventKind::Press && key.modifiers == KeyModifiers::NONE;
+    if app.pending_termination.is_some() {
+        if plain_press {
+            match key.code {
+                KeyCode::Char('y') => app.confirm_termination(send),
+                KeyCode::Esc | KeyCode::Char('n' | 'q') => app.cancel_termination(),
+                _ => {}
+            }
+        }
+        return true;
+    }
+    if plain_press && key.code == KeyCode::Char('x') {
+        app.request_termination();
+        return true;
+    }
+    false
 }
 
 /// Open detail popup — reads memory from already-scanned data, fetches metadata in background
@@ -515,7 +549,7 @@ fn perform_scan(tx: mpsc::Sender<ScanEvent>) {
     let _ = tx.send(ScanEvent::SystemMemory(sys_mem));
 
     // 2. Collect all processes via sysinfo (fast)
-    let processes = collect_processes();
+    let processes = collect_processes(true);
     let _ = tx.send(ScanEvent::Processes(processes));
 
     // 3. Deep scan: measure compressed or swapped pages for processes with RSS >= 5 MB
@@ -541,7 +575,14 @@ fn perform_scan(tx: mpsc::Sender<ScanEvent>) {
 // ─── Shared helpers ─────────────────────────────────────────────────────────
 
 /// Collect all processes via sysinfo — fast, gives RSS and cmdline.
-fn collect_processes() -> Vec<ProcessMemory> {
+fn collect_processes(record_termination_identities: bool) -> Vec<ProcessMemory> {
+    // Bracket the sysinfo and cwd reads with audit tokens. PID reuse during
+    // collection must leave the row without a termination identity.
+    let identities = if record_termination_identities {
+        termination::capture_identities()
+    } else {
+        HashMap::new()
+    };
     let mut sys = System::new_all();
     sys.refresh_all();
     let cwd_map = scanner::bulk_cwd_map();
@@ -557,6 +598,8 @@ fn collect_processes() -> Vec<ProcessMemory> {
         p.cwd = proc.cwd().map(|c| c.to_string_lossy().to_string())
             .unwrap_or_else(|| cwd_map.get(&pid_i).cloned().unwrap_or_default());
         p.threads = 1; // sysinfo 0.33 doesn't expose threads
+        p.termination_identity = identities.get(&pid_i).copied()
+            .filter(|identity| termination::process_identity(pid_i) == Some(*identity));
         p
     }).collect()
 }

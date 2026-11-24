@@ -121,7 +121,18 @@ state. Regrouping never re-fetches.
 
 The table is a flat list of visual rows. Some rows are group headers, some are sub-processes (when a group is expanded). A `RowMap` maps visual row index → (group_index, Option<proc_index>).
 
-Navigation with j/k moves through visual rows. The row map syncs `expanded_group` and `proc_state` so that actions (detail, kill, sort) always target the correct process.
+Navigation with j/k moves through visual rows. The row map syncs
+`expanded_group` and `proc_state` with the highlighted row.
+
+Pressing `x` on a group expands it. On a child row, the confirmation stores
+the displayed name and process identity. The TUI scan binds a row only when
+its Mach audit token matches before and after collecting the process data.
+Background regrouping and sorting leave the pending target intact.
+
+Memo resolves `proc_signal_with_audittoken` at runtime. The kernel validates
+the token and holds the target process reference through signal delivery.
+Memo reports an error when that operation is unavailable.
+[Apple XNU signal implementation](https://github.com/apple-oss-distributions/xnu/blob/xnu-11417.121.6/bsd/kern/proc_info.c#L3564).
 
 ### Group mode and the bridge column
 

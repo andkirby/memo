@@ -112,14 +112,22 @@ project processes are matched by their observed working directories.
 | `Tab` | Toggle App ↔ Project grouping (default: Project) |
 | `Enter` | Expand group / open detail for sub-process |
 | `D` | Open detail popup for selected process |
-| `X` | Kill selected process (`kill -9`) |
+| `x` | Expand selected group or open a confirmation for the selected process |
+| `y` in confirmation | Send SIGKILL to the displayed process |
+| `n` or `Esc` in confirmation | Cancel |
 | `R` | Refresh (full rescan) |
 | `T` / `P` / `S` / `N` | Sort by Total / RSS / Compressed or swapped / Name |
-| `Q` / `Esc` | Quit (Esc also closes the detail popup) |
+| `q` | Quit from the table or close a dialog |
+| `Esc` in details | Close details |
 | Mouse scroll | Navigate |
 | Mouse click | Select row |
 | Double-click | Open detail (sub-process) or expand (group) |
 | Right-click | Toggle expand |
+
+The confirmation shows the process name and PID. macOS verifies the process
+identity as part of sending SIGKILL. The status panel reports stale targets
+and signaling errors. Termination requires the macOS audit-token signal API.
+On older versions without it, Memo reports that termination is unavailable.
 
 ## How it works
 
@@ -156,6 +164,7 @@ src/
 ├── group.rs       Process grouping — App or Project mode (marker walkup on cwd)
 ├── inspect.rs     Project-scoped RSS query: scope, aggregation, text/JSON output
 ├── app.rs         TUI state: navigation, selection, sort, row mapping
+├── termination.rs macOS process identity capture and signaling
 ├── ui.rs          ratatui rendering: header bars, table, detail popup
 └── top.rs         (unused — kept for potential future use)
 ```
@@ -166,6 +175,7 @@ src/
 struct ProcessMemory {
     pid: i32,
     name: String,
+    termination_identity: Option<ProcessIdentity>, // recorded for the TUI
     cmdline: String,
     cwd: String,   // from sysinfo (+ lsof fallback) — used for project grouping
     rss: u64,      // from sysinfo — pages in RAM right now
