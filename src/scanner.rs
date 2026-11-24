@@ -3,12 +3,8 @@ use std::process::Command;
 
 // ─── Process memory — single source of truth ──────────────────────────────
 //
-// Fields are named by WHERE the data comes from, not vague terms:
-//   rss      — sysinfo: pages currently resident in RAM (Activity Monitor style)
-//   swap     — footprint: pages swapped to disk (the one thing footprint is uniquely good at)
-//   threads  — sysinfo: thread count
-//
-// "total" = rss + swap. That's what you'd free if you killed this process.
+// Total is a ranking metric: RSS plus measured compressed or swapped bytes.
+// RSS can include shared pages, and the deep scan covers a subset of processes.
 
 #[derive(Debug, Clone)]
 pub struct ProcessMemory {
@@ -16,14 +12,14 @@ pub struct ProcessMemory {
     pub name: String,
     pub cmdline: String,
     pub cwd: String,    // from sysinfo (+ lsof fallback) — used for project grouping
-    pub rss: u64,       // from sysinfo — honest per-process resident memory
-    pub swap: u64,      // from footprint — pages swapped to disk
+    pub rss: u64,       // resident memory from sysinfo
+    pub compressed_or_swapped: u64, // from footprint, includes pages compressed in RAM
     pub threads: usize,
 }
 
 impl ProcessMemory {
     pub fn total(&self) -> u64 {
-        self.rss.saturating_add(self.swap)
+        self.rss.saturating_add(self.compressed_or_swapped)
     }
 
     pub fn new(pid: i32, name: String, rss: u64) -> Self {
@@ -33,7 +29,7 @@ impl ProcessMemory {
             cmdline: String::new(),
             cwd: String::new(),
             rss,
-            swap: 0,
+            compressed_or_swapped: 0,
             threads: 1,
         }
     }

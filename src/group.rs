@@ -26,18 +26,18 @@ pub struct AppGroup {
     pub kind: GroupKind,
     pub processes: Vec<ProcessMemory>,
     pub total_rss: u64,
-    pub total_swap: u64,
+    pub total_compressed_or_swapped: u64,
     pub thread_count: usize,
 }
 
 impl AppGroup {
     pub fn total(&self) -> u64 {
-        self.total_rss.saturating_add(self.total_swap)
+        self.total_rss.saturating_add(self.total_compressed_or_swapped)
     }
 
     fn recalc(&mut self) {
         self.total_rss = self.processes.iter().map(|p| p.rss).sum();
-        self.total_swap = self.processes.iter().map(|p| p.swap).sum();
+        self.total_compressed_or_swapped = self.processes.iter().map(|p| p.compressed_or_swapped).sum();
         self.thread_count = self.processes.iter().map(|p| p.threads).sum();
     }
 
@@ -246,7 +246,7 @@ fn shorten_in(path: &str, home: &str) -> String {
 
 // ─── Grouping ──────────────────────────────────────────────────────────────
 
-/// Group processes by `mode`, sorted by total memory (rss + swap) descending.
+/// Group processes by `mode`, sorted by the displayed total descending.
 /// Grouping is a pure function of the process list — no hidden state.
 pub fn group_processes(processes: &[ProcessMemory], mode: GroupMode) -> Vec<AppGroup> {
     group_processes_in(processes, mode, &home_dir())
@@ -273,7 +273,7 @@ fn group_processes_in(processes: &[ProcessMemory], mode: GroupMode, home: &str) 
             let name = if kind == GroupKind::Project { shorten_in(&key, home) } else { key };
             let mut g = AppGroup {
                 name, kind, processes: procs,
-                total_rss: 0, total_swap: 0, thread_count: 0,
+                total_rss: 0, total_compressed_or_swapped: 0, thread_count: 0,
             };
             g.recalc();
             g
@@ -310,7 +310,7 @@ mod tests {
     fn pm_cwd(pid: i32, name: &str, rss: u64, cwd: &str, cmdline: &str) -> ProcessMemory {
         ProcessMemory {
             pid, name: name.into(), cmdline: cmdline.into(), cwd: cwd.into(),
-            rss, swap: 0, threads: 1,
+            rss, compressed_or_swapped: 0, threads: 1,
         }
     }
 

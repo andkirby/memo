@@ -42,7 +42,7 @@ struct Args {
     #[arg(long)]
     ps: bool,
 
-    /// Sort: total, rss, swap, name
+    /// Sort by total, rss, swap (compressed or swapped), or name
     #[arg(long, default_value = "total")]
     sort: String,
 
@@ -77,7 +77,7 @@ enum Command {
 enum ScanEvent {
     SystemMemory(scanner::SystemMemory),
     Processes(Vec<ProcessMemory>),
-    SwapBatch(HashMap<i32, u64>),              // pid → swap bytes
+    CompressedOrSwappedBatch(HashMap<i32, u64>), // pid → compressed or swapped bytes
     DetailResult(ProcessDetail),
     Done,
 }
@@ -131,54 +131,66 @@ fn main() -> Result<()> {
 
 // ─── CLI Mode ───────────────────────────────────────────────────────────────
 
-fn run_cli(args: Args) -> Result<()> {
+fn run_cli(args: Args) -> io::Result<()> {
     let mut out = io::stdout().lock();
 
-    let sys_mem = get_system_memory();
-    writeln!(out, "━━━ System Memory ━━━")?;
-    writeln!(out, "RAM:    {} / {} ({:.1}%)",
-        format_size(sys_mem.used_bytes), format_size(sys_mem.total_bytes), sys_mem.used_pct())?;
-    writeln!(out, "Swap:   {} / {} ({:.1}%)",
-        format_size(sys_mem.swap_used), format_size(sys_mem.swap_total), sys_mem.swap_pct())?;
-    writeln!(out, "  App: {}  Wired: {}  Compressed: {}  Cache: {}",
-        format_size(sys_mem.app_memory), format_size(sys_mem.wired),
-        format_size(sys_mem.compressed), format_size(sys_mem.cache))?;
-    writeln!(out)?;
+    write_system_memory(&mut out, &get_system_memory())?;
 
     // Collect processes via sysinfo
     writeln!(out, "Scanning processes...")?;
     let mut processes = collect_processes();
 
-    // Deep scan for swap
-    writeln!(out, "Deep analysis (swap via footprint)...")?;
+    // Deep scan for compressed or swapped pages
+    writeln!(out, "Deep analysis (compressed or swapped via footprint)...")?;
     let rss_threshold = 5 * 1024 * 1024u64;
     let big_pids: Vec<i32> = processes.iter()
         .filter(|p| p.rss >= rss_threshold).map(|p| p.pid).collect();
     writeln!(out, "Deep-scanning {} processes (skipped {} tiny)...",
         big_pids.len(), processes.len() - big_pids.len())?;
 
-    let swap_map = parallel_swap_scan(&big_pids);
+    let compressed_or_swapped = scan_compressed_or_swapped(&big_pids);
     for p in &mut processes {
-        if let Some(swap) = swap_map.get(&p.pid) {
-            p.swap = *swap;
+        if let Some(bytes) = compressed_or_swapped.get(&p.pid) {
+            p.compressed_or_swapped = *bytes;
         }
     }
 
     processes.retain(|p| p.total() > 0);
 
+    write_process_table(&mut out, &args, processes)
+}
+
+fn write_system_memory(out: &mut impl Write, sys_mem: &scanner::SystemMemory) -> io::Result<()> {
+    writeln!(out, "━━━ System Memory ━━━")?;
+    writeln!(out, "RAM:    {} / {} ({:.1}%)",
+        format_size(sys_mem.used_bytes), format_size(sys_mem.total_bytes), sys_mem.used_pct())?;
+    writeln!(out, "Disk swap: {} / {} ({:.1}%)",
+        format_size(sys_mem.swap_used), format_size(sys_mem.swap_total), sys_mem.swap_pct())?;
+    writeln!(out, "  App: {}  Wired: {}  Compressed: {}  Cache: {}",
+        format_size(sys_mem.app_memory), format_size(sys_mem.wired),
+        format_size(sys_mem.compressed), format_size(sys_mem.cache))?;
+    writeln!(out)?;
+    Ok(())
+}
+
+fn write_process_table(
+    out: &mut impl Write,
+    args: &Args,
+    mut processes: Vec<ProcessMemory>,
+) -> io::Result<()> {
     if args.ps {
         match args.sort.as_str() {
             "rss" => processes.sort_by(|a, b| b.rss.cmp(&a.rss)),
-            "swap" => processes.sort_by(|a, b| b.swap.cmp(&a.swap)),
+            "swap" => processes.sort_by(|a, b| b.compressed_or_swapped.cmp(&a.compressed_or_swapped)),
             "name" => processes.sort_by(|a, b| a.name.cmp(&b.name)),
             _ => processes.sort_by(|a, b| b.total().cmp(&a.total())),
         }
-        writeln!(out, "{:<8} {:<35} {:<12} {:<12} {:<12}",
-            "PID", "NAME", "RSS", "SWAP", "TOTAL")?;
-        writeln!(out, "{}", "─".repeat(85))?;
+        writeln!(out, "{:<8} {:<35} {:<12} {:<21} {:<12}",
+            "PID", "NAME", "RSS", "COMPRESSED OR SWAPPED", "TOTAL")?;
+        writeln!(out, "{}", "─".repeat(92))?;
         for p in &processes {
-            writeln!(out, "{:<8} {:<35} {:<12} {:<12} {:<12}",
-                p.pid, truncate(&p.name, 35), format_size(p.rss), format_size(p.swap), format_size(p.total()))?;
+            writeln!(out, "{:<8} {:<35} {:<12} {:<21} {:<12}",
+                p.pid, truncate(&p.name, 35), format_size(p.rss), format_size(p.compressed_or_swapped), format_size(p.total()))?;
         }
     } else {
         let mode = match args.group.as_str() {
@@ -192,25 +204,25 @@ fn run_cli(args: Args) -> Result<()> {
             group::GroupMode::App => ("APP", "apps"),
         };
 
-        writeln!(out, "{:<30} {:<7} {:<24} {:<12} {:<12} {:<12}",
-            noun, "PROCS", "BREAKDOWN", "RSS", "SWAP", "TOTAL")?;
-        writeln!(out, "{}", "─".repeat(100))?;
+        writeln!(out, "{:<30} {:<7} {:<24} {:<12} {:<21} {:<12}",
+            noun, "PROCS", "BREAKDOWN", "RSS", "COMPRESSED OR SWAPPED", "TOTAL")?;
+        writeln!(out, "{}", "─".repeat(112))?;
         for g in &groups {
-            writeln!(out, "{:<30} {:<7} {:<24} {:<12} {:<12} {:<12}",
+            writeln!(out, "{:<30} {:<7} {:<24} {:<12} {:<21} {:<12}",
                 truncate(&g.name, 30), g.processes.len(), truncate(&g.bridge(mode), 24),
-                format_size(g.total_rss), format_size(g.total_swap), format_size(g.total()))?;
+                format_size(g.total_rss), format_size(g.total_compressed_or_swapped), format_size(g.total()))?;
         }
 
         writeln!(out)?;
-        let sum_swap: u64 = processes.iter().map(|p| p.swap).sum();
-        let delta = sys_mem.swap_used.saturating_sub(sum_swap);
-        writeln!(out, "{} {} • {} processes • {} rss • {} swap (system: {})",
+        let sum_rss: u64 = groups.iter().map(|g| g.total_rss).sum();
+        let sum_compressed_or_swapped: u64 =
+            groups.iter().map(|g| g.total_compressed_or_swapped).sum();
+        writeln!(
+            out,
+            "{} {} • {} processes • {} RSS • {} compressed or swapped",
             groups.len(), noun_pl, total_procs,
-            format_size(processes.iter().map(|p| p.rss).sum::<u64>()),
-            format_size(sum_swap), format_size(sys_mem.swap_used))?;
-        if delta > 100 * 1024 * 1024 {
-            writeln!(out, "Note: {} swap unaccounted (from processes below scan threshold)", format_size(delta))?;
-        }
+            format_size(sum_rss), format_size(sum_compressed_or_swapped),
+        )?;
     }
     Ok(())
 }
@@ -317,7 +329,7 @@ fn run_tui() -> Result<()> {
                             KeyCode::Char('x') => app.kill_selected(),
                             KeyCode::Char('t') => { app.sort_column = SortColumn::Total; app.sort_desc = true; app.sort_groups(); }
                             KeyCode::Char('p') => { app.sort_column = SortColumn::Physical; app.sort_desc = true; app.sort_groups(); }
-                            KeyCode::Char('s') => { app.sort_column = SortColumn::Swap; app.sort_desc = true; app.sort_groups(); }
+                            KeyCode::Char('s') => { app.sort_column = SortColumn::CompressedOrSwapped; app.sort_desc = true; app.sort_groups(); }
                             KeyCode::Char('n') => { app.sort_column = SortColumn::Name; app.sort_desc = false; app.sort_groups(); }
                             KeyCode::Tab => app.cycle_group(),
                             _ => {}
@@ -342,10 +354,10 @@ fn run_tui() -> Result<()> {
                     app.is_loading = false;
                     app.status_message = Some(format!("Quick scan done — {} procs", app.all_processes.len()));
                 }
-                ScanEvent::SwapBatch(swap_map) => {
+                ScanEvent::CompressedOrSwappedBatch(compressed_or_swapped) => {
                     for p in &mut app.all_processes {
-                        if let Some(swap) = swap_map.get(&p.pid) {
-                            p.swap = *swap;
+                        if let Some(bytes) = compressed_or_swapped.get(&p.pid) {
+                            p.compressed_or_swapped = *bytes;
                         }
                     }
                     app.recalculate_from(&app.all_processes.clone());
@@ -380,7 +392,7 @@ fn show_detail(app: &App, tx: &mpsc::Sender<ScanEvent>) {
     } else { None };
 
     if let Some(proc) = target.cloned() {
-        // We already have rss + swap from the scan — no re-fetch needed for memory.
+        // Memory values come from the scan.
         // Spawn a background fetch for metadata (cmd, exe, cwd, parent) only.
         let tx = tx.clone();
         thread::spawn(move || {
@@ -451,7 +463,7 @@ fn fetch_detail_meta(proc: ProcessMemory) -> ProcessDetail {
         name: proc.name,
         cmd, exe, cwd, status, start_time, cpu_usage,
         rss: proc.rss,
-        swap: proc.swap,
+        compressed_or_swapped: proc.compressed_or_swapped,
         parent_pid, parent_cmd,
     }
 }
@@ -467,7 +479,7 @@ fn perform_scan(tx: mpsc::Sender<ScanEvent>) {
     let processes = collect_processes();
     let _ = tx.send(ScanEvent::Processes(processes));
 
-    // 3. Deep scan: get swap from footprint for processes with RSS >= 5MB
+    // 3. Deep scan: measure compressed or swapped pages for processes with RSS >= 5 MB
     let rss_threshold = 5 * 1024 * 1024u64;
     let big_pids: Vec<i32> = {
         // Read from the processes we just sent (re-derive from sysinfo since we can't borrow tx data)
@@ -479,9 +491,9 @@ fn perform_scan(tx: mpsc::Sender<ScanEvent>) {
             .collect()
     };
 
-    let swap_map = parallel_swap_scan(&big_pids);
-    if !swap_map.is_empty() {
-        let _ = tx.send(ScanEvent::SwapBatch(swap_map));
+    let compressed_or_swapped = scan_compressed_or_swapped(&big_pids);
+    if !compressed_or_swapped.is_empty() {
+        let _ = tx.send(ScanEvent::CompressedOrSwappedBatch(compressed_or_swapped));
     }
 
     let _ = tx.send(ScanEvent::Done);
@@ -510,8 +522,8 @@ fn collect_processes() -> Vec<ProcessMemory> {
     }).collect()
 }
 
-/// Run footprint in parallel batches and return pid → swap bytes.
-fn parallel_swap_scan(pids: &[i32]) -> HashMap<i32, u64> {
+/// Run footprint in parallel batches and return compressed or swapped bytes by PID.
+fn scan_compressed_or_swapped(pids: &[i32]) -> HashMap<i32, u64> {
     let mut result = HashMap::new();
     if pids.is_empty() { return result; }
 
@@ -520,14 +532,12 @@ fn parallel_swap_scan(pids: &[i32]) -> HashMap<i32, u64> {
     std::thread::scope(|s| {
         for batch in chunks.chunks(4) {
             let handles: Vec<_> = batch.iter()
-                .map(|chunk| s.spawn(|| footprint::get_swap_for_pids(chunk)))
+                .map(|chunk| s.spawn(|| footprint::get_compressed_or_swapped_for_pids(chunk)))
                 .collect();
 
             for handle in handles {
                 if let Ok(fp_map) = handle.join().unwrap() {
-                    for (pid, data) in fp_map {
-                        result.insert(pid, data.swapped_total);
-                    }
+                    result.extend(fp_map);
                 }
             }
         }
@@ -542,8 +552,56 @@ fn truncate(s: &str, max: usize) -> String {
 
 #[cfg(test)]
 mod cli_tests {
-    use super::Args;
+    use super::{
+        Args, ProcessMemory, footprint, scanner::SystemMemory, write_process_table,
+        write_system_memory,
+    };
     use clap::{Parser, error::ErrorKind};
+
+    #[test]
+    fn cli_keeps_process_counter_separate_from_disk_swap() {
+        // footprint uses the "swapped" key for compressed pages even when disk swap is zero.
+        let counters = footprint::parse_compressed_or_swapped(r#"{
+            "processes": [{
+                "pid": 42, "name": "memo-fixture",
+                "categories": {
+                    "MALLOC": {"swapped": 2097152},
+                    "STACK": {"swapped": 1048576}
+                }
+            }]
+        }"#).unwrap();
+        let mib = 1024 * 1024;
+        let mut process = ProcessMemory::new(42, "memo-fixture".into(), 8 * mib);
+        process.compressed_or_swapped = counters[&42];
+
+        for args in [["memo", "--cli"], ["memo", "--ps"]] {
+            let args = Args::try_parse_from(args).unwrap();
+            for (swap_used, disk_label) in [(0, "0B"), (512 * mib, "512.0M")] {
+                let system = SystemMemory {
+                    total_bytes: 1024 * mib,
+                    used_bytes: 600 * mib,
+                    free_bytes: 424 * mib,
+                    swap_total: 1024 * mib,
+                    swap_used,
+                    compressed: 3 * mib,
+                    wired: 0,
+                    app_memory: 0,
+                    cache: 0,
+                };
+                let mut out = Vec::new();
+                write_system_memory(&mut out, &system).unwrap();
+                write_process_table(&mut out, &args, vec![process.clone()]).unwrap();
+                let report = String::from_utf8(out).unwrap();
+                assert!(report.contains(&format!("Disk swap: {disk_label} / 1.0G")));
+                assert!(report.contains("RSS          COMPRESSED OR SWAPPED TOTAL"));
+                let row = report.lines().find(|line| line.contains("memo-fixture")).unwrap();
+                let columns: Vec<_> = row.split_whitespace().collect();
+                assert!(columns.ends_with(&["8.0M", "3.0M", "11.0M"]));
+                assert!(!report.contains("unaccounted"));
+                assert!(!report.contains("(system:"));
+            }
+        }
+    }
 
     #[test]
     fn version_does_not_become_required_for_normal_commands() {

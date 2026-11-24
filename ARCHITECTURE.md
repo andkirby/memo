@@ -2,9 +2,9 @@
 
 ## Design principles
 
-1. **One source of truth per metric** — RSS from sysinfo, swap from footprint. Never mix.
-2. **Detail popup reads scanned data** — no re-fetching memory numbers. The popup's RSS/swap are identical to the table row.
-3. **Honest numbers** — we show raw estimates, not normalized/fitted totals. If per-process swap sums to less than system swap, we say so ("unaccounted").
+1. **One source of truth per metric** — RSS from sysinfo, compressed or swapped pages from footprint, and disk swap from sysctl.
+2. **Detail popup reads scanned data** — no re-fetching memory numbers. The popup uses the same RSS and compressed or swapped bytes as the table row.
+3. **Displayed total** — RSS plus measured compressed or swapped bytes, used for ranking. Groups can count shared RSS pages more than once.
 4. **Grouping is a pure function of the process list** — `group_processes(procs, mode)` has no hidden state. Switching the view (App ↔ Project) re-pivots the same scanned data; it never re-fetches.
 5. **Project identity is observed, not declared** — a process's project is recovered from its cwd (+ marker walkup), with no per-service instrumentation. See [ADR 0001](docs/adr/0001-group-by-project.md).
 
@@ -23,8 +23,8 @@ The inspector's own PID is excluded. Row limits affect output, not totals.
 
 This is distinct from the TUI's nearest-marker/hybrid grouping. The process
 memory model and existing grouping rules are unchanged. Missing cwd limits
-attribution, and swap is unmeasured. The authoritative command, output, and
-error contract is [Agent inspection](docs/agent-inspection.md).
+attribution, and compressed or swapped pages are unmeasured. The authoritative
+command, output, and error contract is [Agent inspection](docs/agent-inspection.md).
 
 ## Data flow
 
@@ -34,14 +34,14 @@ error contract is [Agent inspection](docs/agent-inspection.md).
 └─────────────┘                                                   │
                                                                   ▼
 ┌─────────────┐                                          ┌──────────────────┐
-│  footprint  │──── swap for PIDs with RSS≥5MB ────────► │ ProcessMemory    │
-└─────────────┘    (parallel batches of 20×4)            │ {rss, swap, cwd} │
+│  footprint  │──── cmp/swp for PIDs with RSS≥5MB ──────► │ ProcessMemory    │
+└─────────────┘    (parallel batches of 20×4)            │ rss, cmp/swp, cwd │
 ┌─────────────┐    (one call, ≈0.14s)                    └──────┬───────────┘
 │  lsof -d cwd│──── backfills cwd where sysinfo omits ──►       │
 └─────────────┘                                                 │
 ┌──────────────┐                                                │
 │  vm_stat +   │──── system RAM breakdown ──────────────────────┤
-│  sysctl      │    (App, Wired, Compressed, Cache, Swap)       │
+│  sysctl      │    (App, Wired, Compressed, Cache, Disk swap)   │
 └──────────────┘                                                │
                                                                 ▼
                                                   ┌────────────────────────┐
@@ -57,15 +57,16 @@ error contract is [Agent inspection](docs/agent-inspection.md).
 - **app-specific tag 16** (GPU compositing) — same
 - **Clean __TEXT** pages — the executable binary mapped into every process
 
-For a browser with 100 renderer processes sharing 100 MB of GPU textures, vmmap reports 100 × 100 MB = 10 GB. The real additional cost of killing those processes is near zero (the GPU textures are freed once, not 100 times).
+For a browser with 100 renderer processes sharing 100 MB of GPU textures, a group can sum the same 100 MB allocation 100 times.
 
 sysinfo's RSS only counts pages resident in RAM per process, which matches Activity Monitor and is a much more honest number.
 
-## Why not normalize swap?
+## Process counters and system disk swap
 
-The old code redistributed "missing" swap (system total − sum of per-process) proportionally across scanned processes. This inflated a 1.8 GB swap process to 7 GB because hundreds of tiny swapped processes weren't scanned. The per-process numbers became lies.
-
-Instead, we show raw per-process swap estimates and note the unaccounted delta.
+The `footprint` counter includes pages compressed in RAM as well as pages
+swapped out. System disk swap measures a different quantity, so the two values
+are reported independently. Deep scans cover processes with RSS of at least
+5 MB when `footprint` can read them.
 
 ## Process grouping rules
 
@@ -123,7 +124,7 @@ Navigation with j/k moves through visual rows. The row map syncs `expanded_group
 `App.group_mode: GroupMode { App, Project }` selects the grouping key. `Tab`
 toggles it and regroups from the already-scanned `all_processes` (no re-fetch).
 
-Columns are `NAME | PROCS | BRIDGE | RSS | SWAP | TOTAL`. The bridge column
+Columns are `NAME | PROCS | BRIDGE | RSS | CMP/SWP | TOTAL`. The bridge column
 carries the *other* view's key — runtime breakdown in Project mode, distinct
 project count in App mode — so switching views loses no information. It
 replaces the old `THREADS` column (sysinfo 0.33 doesn't expose thread counts,

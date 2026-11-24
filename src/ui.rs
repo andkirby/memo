@@ -157,7 +157,7 @@ fn render_overview(f: &mut Frame, app: &mut App, area: Rect) {
         let warning = if mem.swap_pct() > 80.0 { " ⚠ swapping" } else { "" };
         let noun = match app.group_mode { GroupMode::Project => "projects", GroupMode::App => "apps" };
         let swap_label = Line::from(vec![
-            Span::styled(" Swap ", Style::default().fg(Color::Rgb(70, 180, 220)).add_modifier(Modifier::BOLD)),
+            Span::styled(" Disk swap ", Style::default().fg(Color::Rgb(70, 180, 220)).add_modifier(Modifier::BOLD)),
             Span::styled(
                 format!("{:.1}%", mem.swap_pct()),
                 Style::default().fg(if swap_pct > 0.80 { Color::Red } else if swap_pct > 0.50 { Color::Yellow } else { Color::Green }).add_modifier(Modifier::BOLD),
@@ -169,12 +169,12 @@ fn render_overview(f: &mut Frame, app: &mut App, area: Rect) {
             Span::styled(health, Style::default().fg(health_color).add_modifier(Modifier::BOLD)),
             Span::raw("  "),
             Span::styled(
-                format!("{} {} · {} procs · {} phys · {} swap{}",
+                format!("{} {} · {} procs · {} RSS · {} compressed or swapped{}",
                     app.groups.len(),
                     noun,
                     app.all_processes.len(),
                     format_size(app.total_phys),
-                    format_size(app.total_swap),
+                    format_size(app.total_compressed_or_swapped),
                     warning,
                 ),
                 Style::default().fg(Color::Rgb(130, 130, 140)),
@@ -210,7 +210,7 @@ fn render_process_table(f: &mut Frame, app: &mut App, area: Rect) {
         "PROCS".to_string(),
         bridge_header.to_string(),
         format!("RSS{}", arrow(SortColumn::Physical)),
-        format!("SWAP{}", arrow(SortColumn::Swap)),
+        format!("CMP/SWP{}", arrow(SortColumn::CompressedOrSwapped)),
         format!("TOTAL{}", arrow(SortColumn::Total)),
     ];
     let header_cells = header_row.iter().enumerate().map(|(i, h)| {
@@ -248,7 +248,7 @@ fn render_process_table(f: &mut Frame, app: &mut App, area: Rect) {
             right(group.processes.len().to_string(), Style::default()),
             Cell::from(bridge_cell).style(Style::default().fg(Color::DarkGray)),
             right(format_size(group.total_rss), Style::default().fg(Color::Green)),
-            right(format_size(group.total_swap), swap_color(group.total_swap)),
+            right(format_size(group.total_compressed_or_swapped), compressed_or_swapped_color(group.total_compressed_or_swapped)),
             right(format_size(group.total()), total_color(group.total())),
         ]).height(1);
 
@@ -276,7 +276,7 @@ fn render_process_table(f: &mut Frame, app: &mut App, area: Rect) {
                     Cell::from(""),
                     Cell::from(short_cmd(&proc.cmdline, bridge_width)).style(Style::default().fg(Color::DarkGray)),
                     right(format_size(proc.rss), Style::default().fg(Color::Green)),
-                    right(format_size(proc.swap), swap_color(proc.swap)),
+                    right(format_size(proc.compressed_or_swapped), compressed_or_swapped_color(proc.compressed_or_swapped)),
                     right(format_size(proc.total()), total_color(proc.total())),
                 ]).height(1);
                 rows.push(child_row);
@@ -393,9 +393,9 @@ fn fit_bridge_tokens(tokens: &[(String, usize)], width: usize) -> String {
     "…".to_string()
 }
 
-fn swap_color(bytes: u64) -> Style {
+fn compressed_or_swapped_color(bytes: u64) -> Style {
     if bytes == 0 {
-        Style::default().fg(Color::DarkGray)  // zero swap is neutral, not "good"
+        Style::default().fg(Color::DarkGray)  // Zero is neutral.
     } else if bytes > 1024 * 1024 * 1024 {
         Style::default().fg(Color::Red)
     } else if bytes > 512 * 1024 * 1024 {
@@ -405,7 +405,7 @@ fn swap_color(bytes: u64) -> Style {
     }
 }
 
-/// Color for total memory (phys + swap) — warm gradient from cool to hot
+/// Color for the displayed total — warm gradient from cool to hot
 /// < 500M → teal, 500M-1G → green, 1-2G → yellow, 2-4G → orange, > 4G → red
 fn total_color(bytes: u64) -> Style {
     let gb = bytes as f64 / (1024.0 * 1024.0 * 1024.0);
@@ -569,20 +569,20 @@ fn render_detail_popup(f: &mut Frame, app: &mut App) {
         };
         f.render_widget(Paragraph::new(parent_text), chunks[2]);
 
-        // Memory — same data as the table row (rss from sysinfo, swap from footprint)
+        // Memory values come from the same scan as the table row.
         let mem_text = vec![
             Line::from(Span::styled("── Memory ──", Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD))),
             Line::from(vec![
-                Span::raw("RSS (resident):  "),
+                Span::raw("RSS (resident):        "),
                 Span::styled(format_size(details.rss), Style::default().fg(Color::Green)),
             ]),
             Line::from(vec![
-                Span::raw("Swap (disk):     "),
-                Span::styled(format_size(details.swap), Style::default().fg(Color::Red)),
+                Span::raw("Compressed or swapped: "),
+                Span::styled(format_size(details.compressed_or_swapped), Style::default().fg(Color::Red)),
             ]),
             Line::from(vec![
-                Span::raw("Total:           "),
-                Span::styled(format_size(details.rss + details.swap), Style::default().fg(Color::Magenta)),
+                Span::raw("Total:                 "),
+                Span::styled(format_size(details.rss.saturating_add(details.compressed_or_swapped)), Style::default().fg(Color::Magenta)),
             ]),
         ];
         f.render_widget(Paragraph::new(mem_text), chunks[3]);
@@ -689,7 +689,7 @@ mod tests {
             kind: GroupKind::Project,
             processes: vec![p(1, "node", 100), p(2, "bun", 50), p(3, "workerd", 25)],
             total_rss: 175,
-            total_swap: 0,
+            total_compressed_or_swapped: 0,
             thread_count: 3,
         }
     }
@@ -769,6 +769,7 @@ mod tests {
             .map(|x| buf[(x, 1)].symbol().to_string()) // y=1 is the header row
             .collect();
         assert!(header.contains("TOTAL ↓"), "default sort is total desc: {}", header);
+        assert!(header.contains("CMP/SWP"), "{}", header);
         assert!(!header.contains("PROJECT ↓"), "{}", header);
         assert!(!header.contains("RSS ↓"), "{}", header);
     }
@@ -887,7 +888,7 @@ mod tests {
                 kind: crate::group::GroupKind::App,
                 processes: procs,
                 total_rss: 100,
-                total_swap: 0,
+                total_compressed_or_swapped: 0,
                 thread_count: 1,
             }];
             let mut terminal = Terminal::new(TestBackend::new(100, 24)).unwrap();

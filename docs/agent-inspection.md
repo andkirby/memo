@@ -1,7 +1,7 @@
 # Agent inspection
 
 `memo inspect` returns a fresh, project-scoped process/RSS snapshot without
-opening the TUI or running swap analysis. It is intended for agents that need a
+opening the TUI or measuring compressed or swapped pages. It is intended for agents that need a
 quick answer to “how much memory is this project using, and which processes
 account for it?”
 
@@ -71,7 +71,7 @@ JSON schema version 1 uses these fields:
 
 Treat this as an observation over an interval, not an atomic OS snapshot. RSS
 may count shared pages more than once. It does not predict memory reclaimed by
-stopping a process. Swap is unmeasured and omitted, not reported as zero.
+stopping a process. Compressed or swapped pages are unmeasured and omitted.
 
 Missing or unresolvable cwd prevents attribution. Processes serving a project
 from `/tmp`, containers, or a shared external daemon can be missed. An empty
@@ -116,5 +116,5 @@ existing collection and metric sources remain shared. The TUI's hybrid grouping
 is separate from inspection membership.
 
 The original brainstorm is retained in
-[IDEA-001](ideas/IDEA-001-agent-project-inspection.md). Swap scans, machine-wide
+[IDEA-001](ideas/IDEA-001-agent-project-inspection.md). Deep scans, machine-wide
 inspection, MCP, and snapshot comparisons remain future proposals.

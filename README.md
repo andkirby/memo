@@ -1,25 +1,24 @@
 # memo — macOS memory usage analyzer
 
-A terminal tool that shows **what is eating your RAM and swap** — grouped by
+A terminal tool that shows **where process memory goes** — grouped by
 **app** (100 Chrome processes → one row) or by **project** (every runtime a
 project spins up → one row).
 
 <img width="896" height="287" alt="image" src="https://github.com/user-attachments/assets/0ace5bf9-e729-43dd-afcd-16901e280df3" />
 
 ```
-PROJECT                         PROCS  RUNTIMES                 RSS       SWAP      TOTAL
-──────────────────────────────────────────────────────────────────────────────────────────
-~/home/self-calendar            23     node:15 bun:3 pi:3 zsh:2  1.2G      1.8G      3.0G
-~/home/markdown-ticket          31     bash:8 sleep:8 node:2 …  0.4G      0.6G      1.0G
-Opera                           37     (app)                     3.4G      4.9G      8.3G
-Telegram                        1      (app)                     191.0M    171.5M    362.5M
+PROJECT                         PROCS  RUNTIMES                 RSS       COMPRESSED OR SWAPPED  TOTAL
+──────────────────────────────────────────────────────────────────────────────────────────────────────────
+~/home/self-calendar            23     node:15 bun:3 pi:3 zsh:2  1.2G      1.8G                   3.0G
+~/home/markdown-ticket          31     bash:8 sleep:8 node:2 …  0.4G      0.6G                   1.0G
+Opera                           37     (app)                     3.4G      4.9G                   8.3G
+Telegram                        1      (app)                     191.0M    171.5M                 362.5M
 ```
 
 ## Why
 
-macOS Activity Monitor doesn't group processes. If Opera runs 37 processes
-using 8 GB total, you see 37 separate entries with no way to understand the
-total cost. `memo` fixes this.
+macOS Activity Monitor doesn't group processes. If Opera runs 37 processes,
+you see 37 separate entries. `memo` combines them into one row.
 
 For developer machines there's a second blind spot: one project fans out
 across node, bun, python, your shell, and your editor's agent — each shows up
@@ -79,11 +78,11 @@ memo --ps
 
 # Sort options (CLI and TUI)
 memo --cli --sort rss     # by resident memory
-memo --cli --sort swap    # by swap usage
+memo --cli --sort swap    # by compressed or swapped pages
 memo --cli --sort total   # by total (default)
 memo --cli --sort name    # alphabetically
 
-# Agent queries — current project, RSS only (no swap scan)
+# Agent queries — current project, RSS only
 memo inspect
 memo inspect --json
 memo inspect --project /path/to/project --limit 20
@@ -106,7 +105,7 @@ project processes are matched by their observed working directories.
 | `D` | Open detail popup for selected process |
 | `X` | Kill selected process (`kill -9`) |
 | `R` | Refresh (full rescan) |
-| `T` / `P` / `S` / `N` | Sort by Total / Physical / Swap / Name |
+| `T` / `P` / `S` / `N` | Sort by Total / RSS / Compressed or swapped / Name |
 | `Q` / `Esc` | Quit (Esc also closes the detail popup) |
 | Mouse scroll | Navigate |
 | Mouse click | Select row |
@@ -119,10 +118,11 @@ project processes are matched by their observed working directories.
 
 | Data | Source | Why |
 |---|---|---|
-| **RSS** (resident memory) | `sysinfo` crate | Honest per-process number, matches Activity Monitor |
-| **Swap** | macOS `footprint` tool | Only reliable per-process swap source on macOS |
+| **RSS** (resident memory) | `sysinfo` crate | Resident bytes per process |
+| **Compressed or swapped** (`CMP/SWP` in the TUI) | macOS `footprint` tool | Per-process pages compressed or swapped out by the kernel |
 | **cwd** (working dir) | `sysinfo` + one bulk `lsof -d cwd` | Resolves each process to its project (marker walkup) |
 | **System RAM** | `vm_stat` + `sysctl` | Breakdown: App / Wired / Compressed / Cache |
+| **Disk swap** | `sysctl vm.swapusage` | System-wide disk swap usage |
 
 It does **not** use `vmmap`'s "Physical Footprint" because that metric includes GPU backing stores (IOSurface) and shared `__TEXT` pages that are shared across processes. Summing those across grouped processes produces impossible numbers (e.g., 35 GB for Opera on a 16 GB machine).
 
@@ -130,7 +130,7 @@ It does **not** use `vmmap`'s "Physical Footprint" because that metric includes 
 
 1. **System memory** — `vm_stat` + `sysctl` (instant)
 2. **Process list** — `sysinfo` for all processes with RSS + cmdline + cwd (fast); one bulk `lsof -d cwd` call backfills cwd where sysinfo omits it
-3. **Swap accounting** — `footprint` in parallel batches for processes with RSS ≥ 5 MB
+3. **Compressed or swapped pages** — `footprint` in parallel batches for processes with RSS ≥ 5 MB
 
 Steps 1-2 take <1s. Step 3 takes ~8s for ~350 processes (parallel batches of 20 PIDs × 4 concurrent).
 
@@ -143,7 +143,7 @@ Agent interface: [current contract](docs/agent-inspection.md) and
 src/
 ├── main.rs        CLI parsing, TUI event loop, scan orchestration
 ├── scanner.rs     ProcessMemory, SystemMemory, vm_stat/sysctl parsing
-├── footprint.rs   macOS footprint CLI wrapper (swap data only)
+├── footprint.rs   macOS footprint wrapper for compressed or swapped pages
 ├── group.rs       Process grouping — App or Project mode (marker walkup on cwd)
 ├── inspect.rs     Project-scoped RSS query: scope, aggregation, text/JSON output
 ├── app.rs         TUI state: navigation, selection, sort, row mapping
@@ -160,10 +160,10 @@ struct ProcessMemory {
     cmdline: String,
     cwd: String,   // from sysinfo (+ lsof fallback) — used for project grouping
     rss: u64,      // from sysinfo — pages in RAM right now
-    swap: u64,     // from footprint — pages swapped to disk
+    compressed_or_swapped: u64, // from footprint
     threads: usize,
 }
-// total() = rss + swap — that's what you'd free if you killed this process
+// total() = rss + compressed_or_swapped
 ```
 
 ### Process grouping
@@ -196,9 +196,16 @@ Rules (App mode):
 | Wired | 3.65 GB | ~3.6 GB | Near exact |
 | Compressed | 6.43 GB | ~5.4 GB | We use "occupied by compressor" (physical), AM may include overhead |
 | Cached Files | 1.83 GB | ~1.5 GB | File-backed pages (close) |
-| Swap | 6.70 GB | matches | Same `sysctl vm.swapusage` source |
+| Disk swap | 6.70 GB | matches | Same `sysctl vm.swapusage` source |
 
-The per-process "RSS" column matches what `ps aux` and Activity Monitor show. The per-process "swap" comes from Apple's `footprint` tool which is the only reliable way to get per-process swap on macOS.
+The per-process RSS column uses resident memory, as in `ps aux`.
+Apple's `footprint` counter includes pages compressed in RAM, so it can be
+nonzero even when system disk swap is zero.
+
+The displayed total adds RSS and the measured compressed or swapped bytes for
+ranking. RSS can count shared pages in multiple processes, and the deep scan
+covers only eligible processes. Actual memory reclaimed on exit depends on which
+pages remain shared or reclaimable.
 
 ## Known limitations
 
@@ -207,8 +214,7 @@ The per-process "RSS" column matches what `ps aux` and Activity Monitor show. Th
 - **Tested on macOS Sonoma (14) only.** Expected to run on macOS 11 Big Sur and later (the arm64 slice requires Apple Silicon, i.e. 11+ anyway). The Intel slice is **cross-compiled in CI and not run-tested on Intel hardware** — it should work, but treat it as best-effort.
 - **Intel is end-of-life.** macOS 26 Tahoe (Sept 2025) is the last release supporting Intel Macs; its successor (Golden Gate, fall 2026) is Apple-Silicon-only. The `memo-macos-x86_64` build targets that shrinking tail.
 - **Compressed memory gap** — Activity Monitor shows more compressed memory than our `vm_stat` reading. This is because AM uses private `host_statistics64()` API.
-- **Swap unaccounted** — processes with RSS < 5 MB are skipped during deep scan. Their swap contribution is shown as "unaccounted" in CLI mode. This is a deliberate speed/accuracy tradeoff.
-- **Shared memory not deducted** — if two processes share 100 MB of memory, each shows 100 MB RSS. The "total if killed" is approximate. This is a fundamental limitation of per-process accounting.
+- **Partial deep-scan coverage** — processes with RSS below 5 MB are skipped, and some eligible processes may be inaccessible. Totals include the bytes from successful measurements.
 
 ## License
 

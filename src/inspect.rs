@@ -4,8 +4,7 @@
 //! else nearest existing project marker; without either → `project_not_found`.
 //! `--project PATH` selects that exact directory. Membership is cwd-based
 //! only: a process belongs when its resolvable cwd is the scope or a
-//! descendant. No argv/ancestry inference; missing swap is never reported
-//! (RSS-only first release).
+//! descendant. Membership uses cwd only. Output includes RSS only.
 
 use crate::scanner::ProcessMemory;
 use chrono::{DateTime, SecondsFormat, Utc};

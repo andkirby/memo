@@ -26,16 +26,14 @@ struct FootprintProcess {
 struct FootprintAuxiliary { #[allow(dead_code)] phys_footprint: u64 }
 
 #[derive(Debug, Deserialize)]
-struct FootprintCategory { #[allow(dead_code)] swapped: u64 }
-
-/// Swap data extracted from `footprint` for a single process.
-#[derive(Debug, Clone)]
-pub struct SwapData {
-    pub swapped_total: u64,
+struct FootprintCategory {
+    // Apple's JSON key covers both compressed and swapped pages.
+    #[serde(rename = "swapped")]
+    compressed_or_swapped: u64,
 }
 
-/// Run `footprint` on a batch of PIDs and extract per-process swap data.
-pub fn get_swap_for_pids(pids: &[i32]) -> Result<HashMap<i32, SwapData>> {
+/// Run `footprint` on a batch of PIDs and return compressed or swapped bytes by PID.
+pub fn get_compressed_or_swapped_for_pids(pids: &[i32]) -> Result<HashMap<i32, u64>> {
     if pids.is_empty() {
         return Ok(HashMap::new());
     }
@@ -62,14 +60,15 @@ pub fn get_swap_for_pids(pids: &[i32]) -> Result<HashMap<i32, SwapData>> {
     let content = fs::read_to_string(&tmp_path).context("Failed to read footprint output")?;
     let _ = fs::remove_file(&tmp_path);
 
+    parse_compressed_or_swapped(&content)
+}
+
+pub(crate) fn parse_compressed_or_swapped(content: &str) -> Result<HashMap<i32, u64>> {
     let output: FootprintOutput =
-        serde_json::from_str(&content).context("Failed to parse footprint JSON")?;
+        serde_json::from_str(content).context("Failed to parse footprint JSON")?;
 
-    let mut map = HashMap::new();
-    for p in output.processes {
-        let swapped = p.categories.values().map(|c| c.swapped).sum();
-        map.insert(p.pid, SwapData { swapped_total: swapped });
-    }
-
-    Ok(map)
+    Ok(output.processes.into_iter().map(|p| {
+        let bytes = p.categories.values().map(|c| c.compressed_or_swapped).sum();
+        (p.pid, bytes)
+    }).collect())
 }

@@ -34,7 +34,7 @@ impl RowMap { pub fn new() -> Self { Self::default() } }
 // ─── Sort ───────────────────────────────────────────────────────────────────
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum SortColumn { Name, Physical, Swap, Total }
+pub enum SortColumn { Name, Physical, CompressedOrSwapped, Total }
 
 // ─── View mode ──────────────────────────────────────────────────────────────
 // ViewMode { Overview, Ps } removed — see ADR 0001. The TUI's old Tab toggle
@@ -54,7 +54,7 @@ pub struct ProcessDetail {
     pub cpu_usage: f32,
     // Memory — read directly from app.all_processes, not re-fetched
     pub rss: u64,
-    pub swap: u64,
+    pub compressed_or_swapped: u64,
     pub parent_pid: Option<i32>,
     pub parent_cmd: Option<String>,
 }
@@ -86,7 +86,7 @@ pub struct App {
     pub popup_area: Option<Rect>,   // Some while the detail popup is on screen
     pub spinner_idx: usize,
     pub total_phys: u64,
-    pub total_swap: u64,
+    pub total_compressed_or_swapped: u64,
 }
 
 impl App {
@@ -115,7 +115,7 @@ impl App {
             popup_area: None,
             spinner_idx: 0,
             total_phys: 0,
-            total_swap: 0,
+            total_compressed_or_swapped: 0,
         }
     }
 
@@ -230,7 +230,7 @@ impl App {
             let ord = match self.sort_column {
                 SortColumn::Name => a.name.cmp(&b.name),
                 SortColumn::Physical => a.total_rss.cmp(&b.total_rss),
-                SortColumn::Swap => a.total_swap.cmp(&b.total_swap),
+                SortColumn::CompressedOrSwapped => a.total_compressed_or_swapped.cmp(&b.total_compressed_or_swapped),
                 SortColumn::Total => a.total().cmp(&b.total()),
             };
             if self.sort_desc { ord.reverse() } else { ord }
@@ -249,7 +249,7 @@ fn sort_children(procs: &mut [ProcessMemory], col: &SortColumn, desc: bool) {
         let mut ord = match col {
             SortColumn::Name => a.name.cmp(&b.name),
             SortColumn::Physical => a.rss.cmp(&b.rss),
-            SortColumn::Swap => a.swap.cmp(&b.swap),
+            SortColumn::CompressedOrSwapped => a.compressed_or_swapped.cmp(&b.compressed_or_swapped),
             SortColumn::Total => a.total().cmp(&b.total()),
         };
         if desc { ord = ord.reverse(); }
@@ -271,7 +271,7 @@ fn sort_children(procs: &mut [ProcessMemory], col: &SortColumn, desc: bool) {
 
     pub fn recalculate_from(&mut self, processes: &[ProcessMemory]) {
         self.total_phys = processes.iter().map(|p| p.rss).sum();
-        self.total_swap = processes.iter().map(|p| p.swap).sum();
+        self.total_compressed_or_swapped = processes.iter().map(|p| p.compressed_or_swapped).sum();
         self.groups = crate::group::group_processes(processes, self.group_mode);
         self.sort_groups();
     }
@@ -446,9 +446,9 @@ mod tests {
 
     // ─── Sorting ────────────────────────────────────────────────────
 
-    fn pm(pid: i32, name: &str, rss: u64, swap: u64) -> ProcessMemory {
+    fn pm(pid: i32, name: &str, rss: u64, compressed_or_swapped: u64) -> ProcessMemory {
         let mut p = ProcessMemory::new(pid, name.to_string(), rss);
-        p.swap = swap;
+        p.compressed_or_swapped = compressed_or_swapped;
         p
     }
 
