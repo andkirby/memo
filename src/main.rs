@@ -16,7 +16,7 @@ use std::{
 
 use anyhow::Result;
 use app::{App, ProcessDetail, SortColumn};
-use clap::{Parser, Subcommand};
+use clap::{CommandFactory, Parser, Subcommand, error::ErrorKind};
 use crossterm::{
     event::{self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, MouseEvent, MouseEventKind},
     execute,
@@ -38,13 +38,18 @@ struct Args {
     #[arg(long)]
     cli: bool,
 
+    /// RSS-only process scan (requires --cli, skips footprint)
+    #[arg(long, requires = "cli")]
+    quick: bool,
+
     /// Show ungrouped process list
     #[arg(long)]
     ps: bool,
 
-    /// Sort by total, rss, swap (compressed or swapped), or name
-    #[arg(long, default_value = "total")]
-    sort: String,
+    /// Sort by total (default), rss, swap (compressed or swapped), or name.
+    /// With --quick, use rss (default) or name.
+    #[arg(long)]
+    sort: Option<String>,
 
     /// Group mode for --cli: app, project
     #[arg(long, default_value = "app")]
@@ -52,6 +57,21 @@ struct Args {
 
     #[command(subcommand)]
     command: Option<Command>,
+}
+
+impl Args {
+    fn sort_column(&self) -> Result<SortColumn, clap::Error> {
+        match (self.quick, self.sort.as_deref()) {
+            (_, Some("rss")) | (true, None) => Ok(SortColumn::Physical),
+            (_, Some("name")) => Ok(SortColumn::Name),
+            (false, Some("swap")) => Ok(SortColumn::CompressedOrSwapped),
+            (false, _) => Ok(SortColumn::Total),
+            (true, Some(value)) => Err(Self::command().error(
+                ErrorKind::InvalidValue,
+                format!("--sort {value} is unavailable with --quick. Use rss or name."),
+            )),
+        }
+    }
 }
 
 #[derive(Subcommand, Debug)]
@@ -112,7 +132,8 @@ fn main() -> Result<()> {
     }
 
     if args.cli || args.ps {
-        run_cli(args)?;
+        let sort = args.sort_column().unwrap_or_else(|error| error.exit());
+        run_cli(args, sort)?;
     } else {
         if let Ok(file) = File::create("/dev/null") {
             use std::os::unix::io::AsRawFd;
@@ -131,7 +152,7 @@ fn main() -> Result<()> {
 
 // ─── CLI Mode ───────────────────────────────────────────────────────────────
 
-fn run_cli(args: Args) -> io::Result<()> {
+fn run_cli(args: Args, sort: SortColumn) -> io::Result<()> {
     let mut out = io::stdout().lock();
 
     write_system_memory(&mut out, &get_system_memory())?;
@@ -140,24 +161,27 @@ fn run_cli(args: Args) -> io::Result<()> {
     writeln!(out, "Scanning processes...")?;
     let mut processes = collect_processes();
 
-    // Deep scan for compressed or swapped pages
-    writeln!(out, "Deep analysis (compressed or swapped via footprint)...")?;
-    let rss_threshold = 5 * 1024 * 1024u64;
-    let big_pids: Vec<i32> = processes.iter()
-        .filter(|p| p.rss >= rss_threshold).map(|p| p.pid).collect();
-    writeln!(out, "Deep-scanning {} processes (skipped {} tiny)...",
-        big_pids.len(), processes.len() - big_pids.len())?;
+    if args.quick {
+        writeln!(out, "RSS-only process scan.")?;
+    } else {
+        writeln!(out, "Deep analysis (compressed or swapped via footprint)...")?;
+        let rss_threshold = 5 * 1024 * 1024u64;
+        let big_pids: Vec<i32> = processes.iter()
+            .filter(|p| p.rss >= rss_threshold).map(|p| p.pid).collect();
+        writeln!(out, "Deep-scanning {} processes (skipped {} tiny)...",
+            big_pids.len(), processes.len() - big_pids.len())?;
 
-    let compressed_or_swapped = scan_compressed_or_swapped(&big_pids);
-    for p in &mut processes {
-        if let Some(bytes) = compressed_or_swapped.get(&p.pid) {
-            p.compressed_or_swapped = *bytes;
+        let compressed_or_swapped = scan_compressed_or_swapped(&big_pids);
+        for p in &mut processes {
+            if let Some(bytes) = compressed_or_swapped.get(&p.pid) {
+                p.compressed_or_swapped = *bytes;
+            }
         }
     }
 
     processes.retain(|p| p.total() > 0);
 
-    write_process_table(&mut out, &args, processes)
+    write_process_table(&mut out, &args, sort, processes)
 }
 
 fn write_system_memory(out: &mut impl Write, sys_mem: &scanner::SystemMemory) -> io::Result<()> {
@@ -176,55 +200,70 @@ fn write_system_memory(out: &mut impl Write, sys_mem: &scanner::SystemMemory) ->
 fn write_process_table(
     out: &mut impl Write,
     args: &Args,
+    sort: SortColumn,
     mut processes: Vec<ProcessMemory>,
 ) -> io::Result<()> {
+    let descending = sort != SortColumn::Name;
+    let extra_columns = if args.quick { "" } else { " COMPRESSED OR SWAPPED TOTAL" };
     if args.ps {
-        match args.sort.as_str() {
-            "rss" => processes.sort_by(|a, b| b.rss.cmp(&a.rss)),
-            "swap" => processes.sort_by(|a, b| b.compressed_or_swapped.cmp(&a.compressed_or_swapped)),
-            "name" => processes.sort_by(|a, b| a.name.cmp(&b.name)),
-            _ => processes.sort_by(|a, b| b.total().cmp(&a.total())),
-        }
-        writeln!(out, "{:<8} {:<35} {:<12} {:<21} {:<12}",
-            "PID", "NAME", "RSS", "COMPRESSED OR SWAPPED", "TOTAL")?;
-        writeln!(out, "{}", "─".repeat(92))?;
+        processes.sort_by(|a, b| sort.compare_processes(a, b, descending));
+        writeln!(out, "{:<8} {:<35} {:<12}{}", "PID", "NAME", "RSS", extra_columns)?;
+        writeln!(out, "{}", "─".repeat(if args.quick { 57 } else { 92 }))?;
         for p in &processes {
-            writeln!(out, "{:<8} {:<35} {:<12} {:<21} {:<12}",
-                p.pid, truncate(&p.name, 35), format_size(p.rss), format_size(p.compressed_or_swapped), format_size(p.total()))?;
+            write!(out, "{:<8} {:<35} {:<12}", p.pid, truncate(&p.name, 35), format_size(p.rss))?;
+            write_deep_scan_columns(out, args.quick, p.compressed_or_swapped, p.total())?;
         }
     } else {
         let mode = match args.group.as_str() {
             "project" => group::GroupMode::Project,
             _ => group::GroupMode::App,
         };
-        let groups = group::group_processes(&processes, mode);
+        let mut groups = group::group_processes(&processes, mode);
+        if sort != SortColumn::Total {
+            groups.sort_by(|a, b| sort.compare_groups(a, b, descending));
+        }
         let total_procs: usize = groups.iter().map(|g| g.processes.len()).sum();
         let (noun, noun_pl) = match mode {
             group::GroupMode::Project => ("PROJECT", "projects"),
             group::GroupMode::App => ("APP", "apps"),
         };
 
-        writeln!(out, "{:<30} {:<7} {:<24} {:<12} {:<21} {:<12}",
-            noun, "PROCS", "BREAKDOWN", "RSS", "COMPRESSED OR SWAPPED", "TOTAL")?;
-        writeln!(out, "{}", "─".repeat(112))?;
+        writeln!(out, "{:<30} {:<7} {:<24} {:<12}{}",
+            noun, "PROCS", "BREAKDOWN", "RSS", extra_columns)?;
+        writeln!(out, "{}", "─".repeat(if args.quick { 76 } else { 112 }))?;
         for g in &groups {
-            writeln!(out, "{:<30} {:<7} {:<24} {:<12} {:<21} {:<12}",
+            write!(out, "{:<30} {:<7} {:<24} {:<12}",
                 truncate(&g.name, 30), g.processes.len(), truncate(&g.bridge(mode), 24),
-                format_size(g.total_rss), format_size(g.total_compressed_or_swapped), format_size(g.total()))?;
+                format_size(g.total_rss))?;
+            write_deep_scan_columns(out, args.quick, g.total_compressed_or_swapped, g.total())?;
         }
 
         writeln!(out)?;
         let sum_rss: u64 = groups.iter().map(|g| g.total_rss).sum();
-        let sum_compressed_or_swapped: u64 =
-            groups.iter().map(|g| g.total_compressed_or_swapped).sum();
-        writeln!(
+        write!(
             out,
-            "{} {} • {} processes • {} RSS • {} compressed or swapped",
-            groups.len(), noun_pl, total_procs,
-            format_size(sum_rss), format_size(sum_compressed_or_swapped),
+            "{} {} • {} processes • {} RSS",
+            groups.len(), noun_pl, total_procs, format_size(sum_rss),
         )?;
+        if !args.quick {
+            let bytes = groups.iter().map(|g| g.total_compressed_or_swapped).sum();
+            write!(out, " • {} compressed or swapped", format_size(bytes))?;
+        }
+        writeln!(out)?;
     }
     Ok(())
+}
+
+fn write_deep_scan_columns(
+    out: &mut impl Write,
+    quick: bool,
+    compressed_or_swapped: u64,
+    total: u64,
+) -> io::Result<()> {
+    if !quick {
+        write!(out, " {:<21} {:<12}", format_size(compressed_or_swapped), format_size(total))?;
+    }
+    writeln!(out)
 }
 
 // ─── TUI Mode ───────────────────────────────────────────────────────────────
@@ -590,7 +629,8 @@ mod cli_tests {
                 };
                 let mut out = Vec::new();
                 write_system_memory(&mut out, &system).unwrap();
-                write_process_table(&mut out, &args, vec![process.clone()]).unwrap();
+                write_process_table(&mut out, &args, args.sort_column().unwrap(), vec![process.clone()])
+                    .unwrap();
                 let report = String::from_utf8(out).unwrap();
                 assert!(report.contains(&format!("Disk swap: {disk_label} / 1.0G")));
                 assert!(report.contains("RSS          COMPRESSED OR SWAPPED TOTAL"));
@@ -599,6 +639,81 @@ mod cli_tests {
                 assert!(columns.ends_with(&["8.0M", "3.0M", "11.0M"]));
                 assert!(!report.contains("unaccounted"));
                 assert!(!report.contains("(system:"));
+            }
+        }
+    }
+
+    #[test]
+    fn grouped_cli_ranks_by_the_requested_metric() {
+        struct ProjectFixture(std::path::PathBuf);
+        impl Drop for ProjectFixture {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_dir_all(&self.0);
+            }
+        }
+
+        // Grouping recognizes project markers under the user's home.
+        // Keep the common prefix short enough for all row names to fit.
+        let home = std::env::var_os("HOME").expect("project grouping needs HOME");
+        let id = uuid::Uuid::new_v4().simple().to_string();
+        let fixture_name = format!(".memo-{}", &id[..8]);
+        let fixture_path = std::path::PathBuf::from(home).join(&fixture_name);
+        std::fs::create_dir(&fixture_path).unwrap();
+        let project_fixture = ProjectFixture(fixture_path);
+        let fixture = [
+            ("memo-alpha", 100, 0),
+            ("memo-beta", 60, 210),
+            ("memo-gamma", 90, 190),
+        ];
+        let processes: Vec<_> = fixture
+            .into_iter()
+            .enumerate()
+            .map(|(id, (name, rss, counter))| {
+                let root = project_fixture.0.join(name);
+                std::fs::create_dir(&root).unwrap();
+                std::fs::write(root.join("package.json"), "{}").unwrap();
+                let mut process = ProcessMemory::new(id as i32 + 1, name.into(), rss);
+                process.cwd = root.to_str().unwrap().into();
+                process.compressed_or_swapped = counter;
+                process
+            })
+            .collect();
+        let total = ["memo-gamma", "memo-beta", "memo-alpha"];
+        let rss = ["memo-alpha", "memo-gamma", "memo-beta"];
+        let counter = ["memo-beta", "memo-gamma", "memo-alpha"];
+        let name = ["memo-alpha", "memo-beta", "memo-gamma"];
+
+        for group in ["app", "project"] {
+            let prefix = if group == "project" {
+                format!("~/{fixture_name}/")
+            } else {
+                String::new()
+            };
+            for (flags, expected, header) in [
+                (&[][..], total, "TOTAL"),
+                (&["--sort", "total"], total, "TOTAL"),
+                (&["--sort", "rss"], rss, "TOTAL"),
+                (&["--sort", "swap"], counter, "TOTAL"),
+                (&["--sort", "name"], name, "TOTAL"),
+                (&["--quick"], rss, "RSS"),
+                (&["--quick", "--sort", "rss"], rss, "RSS"),
+                (&["--quick", "--sort", "name"], name, "RSS"),
+            ] {
+                let args = Args::try_parse_from(
+                    ["memo", "--cli", "--group", group].into_iter().chain(flags.iter().copied()),
+                ).unwrap();
+                let mut out = Vec::new();
+                write_process_table(&mut out, &args, args.sort_column().unwrap(), processes.clone())
+                    .unwrap();
+                let report = String::from_utf8(out).unwrap();
+                let columns = report.lines().next().unwrap();
+                assert!(columns.trim_end().ends_with(header), "{columns}");
+                let names: Vec<_> = report.lines()
+                    .filter_map(|line| line.strip_prefix(&prefix))
+                    .filter(|line| line.starts_with("memo-"))
+                    .map(|line| line.split_whitespace().next().unwrap())
+                    .collect();
+                assert_eq!(names, expected, "group {group}, flags {flags:?}");
             }
         }
     }

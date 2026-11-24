@@ -26,6 +26,10 @@ memory model and existing grouping rules are unchanged. Missing cwd limits
 attribution, and compressed or swapped pages are unmeasured. The authoritative
 command, output, and error contract is [Agent inspection](docs/agent-inspection.md).
 
+`memo --cli --quick` uses the same app or project grouping as the full CLI
+scan and returns RSS without invoking `footprint`. It accepts RSS and name
+sorting. The system memory header is shared with the full CLI.
+
 ## Data flow
 
 ```

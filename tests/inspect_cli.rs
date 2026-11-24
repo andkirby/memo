@@ -26,6 +26,7 @@ fn json_argument_errors_are_parseable_including_clap_failures() {
         vec!["inspect", "--json", "--project"],
         vec!["inspect", "--json", "--unknown"],
         vec!["--cli", "inspect", "--json"],
+        vec!["--cli", "--quick", "inspect", "--json"],
         vec!["--sort", "total", "inspect", "--json"],
         vec!["--group", "app", "inspect", "--json"],
     ] {

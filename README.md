@@ -76,7 +76,11 @@ memo --cli --group project
 # CLI — all processes ungrouped
 memo --ps
 
-# Sort options (CLI and TUI)
+# CLI — RSS-only scan with no footprint subprocess
+memo --cli --quick
+memo --cli --quick --group project --sort name
+
+# Full-scan sort options (also apply to app and project groups)
 memo --cli --sort rss     # by resident memory
 memo --cli --sort swap    # by compressed or swapped pages
 memo --cli --sort total   # by total (default)
@@ -90,6 +94,11 @@ memo inspect --project /path/to/project --limit 20
 # Executable version
 memo --version           # also: memo -v
 ```
+
+`--quick` defaults to RSS descending and also accepts `--sort name`.
+The process table omits compressed or swapped bytes and totals. The system
+memory header still reports disk swap. Combine `--cli --quick` with `--ps`
+for an ungrouped RSS-only list.
 
 See [Agent inspection](docs/agent-inspection.md) for scope rules, JSON fields,
 and error handling. Automatic scope prefers the enclosing Git worktree root;

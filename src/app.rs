@@ -2,6 +2,7 @@ use crate::group::{AppGroup, GroupMode};
 use crate::scanner::{ProcessMemory, SystemMemory};
 use ratatui::layout::Rect;
 use ratatui::widgets::TableState;
+use std::cmp::Ordering;
 use std::time::{Duration, Instant};
 
 /// Two clicks on the same spot within this window count as a double-click.
@@ -35,6 +36,28 @@ impl RowMap { pub fn new() -> Self { Self::default() } }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SortColumn { Name, Physical, CompressedOrSwapped, Total }
+
+impl SortColumn {
+    pub fn compare_groups(self, a: &AppGroup, b: &AppGroup, descending: bool) -> Ordering {
+        let order = match self {
+            Self::Name => a.name.cmp(&b.name),
+            Self::Physical => a.total_rss.cmp(&b.total_rss),
+            Self::CompressedOrSwapped => a.total_compressed_or_swapped.cmp(&b.total_compressed_or_swapped),
+            Self::Total => a.total().cmp(&b.total()),
+        };
+        if descending { order.reverse() } else { order }
+    }
+
+    pub fn compare_processes(self, a: &ProcessMemory, b: &ProcessMemory, descending: bool) -> Ordering {
+        let order = match self {
+            Self::Name => a.name.cmp(&b.name),
+            Self::Physical => a.rss.cmp(&b.rss),
+            Self::CompressedOrSwapped => a.compressed_or_swapped.cmp(&b.compressed_or_swapped),
+            Self::Total => a.total().cmp(&b.total()),
+        };
+        if descending { order.reverse() } else { order }
+    }
+}
 
 // ─── View mode ──────────────────────────────────────────────────────────────
 // ViewMode { Overview, Ps } removed — see ADR 0001. The TUI's old Tab toggle
@@ -226,15 +249,8 @@ impl App {
     // ─── Sort ───────────────────────────────────────────────────────────
 
     pub fn sort_groups(&mut self) {
-        self.groups.sort_by(|a, b| {
-            let ord = match self.sort_column {
-                SortColumn::Name => a.name.cmp(&b.name),
-                SortColumn::Physical => a.total_rss.cmp(&b.total_rss),
-                SortColumn::CompressedOrSwapped => a.total_compressed_or_swapped.cmp(&b.total_compressed_or_swapped),
-                SortColumn::Total => a.total().cmp(&b.total()),
-            };
-            if self.sort_desc { ord.reverse() } else { ord }
-        });
+        self.groups
+            .sort_by(|a, b| self.sort_column.compare_groups(a, b, self.sort_desc));
         for g in &mut self.groups {
             Self::sort_children(&mut g.processes, &self.sort_column, self.sort_desc);
         }
@@ -246,14 +262,8 @@ impl App {
 /// ascending pid so ordering is deterministic across refreshes.
 fn sort_children(procs: &mut [ProcessMemory], col: &SortColumn, desc: bool) {
     procs.sort_by(|a, b| {
-        let mut ord = match col {
-            SortColumn::Name => a.name.cmp(&b.name),
-            SortColumn::Physical => a.rss.cmp(&b.rss),
-            SortColumn::CompressedOrSwapped => a.compressed_or_swapped.cmp(&b.compressed_or_swapped),
-            SortColumn::Total => a.total().cmp(&b.total()),
-        };
-        if desc { ord = ord.reverse(); }
-        ord.then_with(|| a.pid.cmp(&b.pid))
+        col.compare_processes(a, b, desc)
+            .then_with(|| a.pid.cmp(&b.pid))
     });
 }
 
