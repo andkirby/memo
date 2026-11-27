@@ -2,11 +2,12 @@
 
 ## Design principles
 
-1. **One source of truth per metric** — RSS from sysinfo, compressed or swapped pages from footprint, and disk swap from sysctl.
-2. **Detail popup reads scanned data** — no re-fetching memory numbers. The popup uses the same RSS and compressed or swapped bytes as the table row.
-3. **Displayed total** — RSS plus measured compressed or swapped bytes, used for ranking. Groups can count shared RSS pages more than once.
-4. **Grouping is a pure function of the process list** — `group_processes(procs, mode)` has no hidden state. Switching the view (App ↔ Project) re-pivots the same scanned data; it never re-fetches.
-5. **Project identity is observed, not declared** — a process's project is recovered from its cwd (+ marker walkup), with no per-service instrumentation. See [ADR 0001](docs/adr/0001-group-by-project.md).
+1. **One source of truth per metric** — RSS from sysinfo; footprint and its compressed or swapped part from Apple's `footprint`; disk swap from sysctl.
+2. **A row's footprint is one measurement of exactly that row's PIDs** — process rows measure one PID; multi-process group rows measure the group's PID set, where Apple counts shared memory once. Footprint values are never added across processes, and never depend on PID batching.
+3. **Missing is not zero** — deep values are `Pending`, `Unavailable`, `Measured`, or (groups) `Partial`, a lower bound over the readable members. Sorting puts rows without a value last.
+4. **Detail popup reads scanned data** — no re-fetching memory numbers. The popup shows the same process measurement as the expanded row.
+5. **Grouping is a pure function of the process list** — `group_processes(procs, mode)` has no hidden state. Switching the view (App ↔ Project) re-pivots the same scanned data and looks up group measurements by PID set; it never re-fetches.
+6. **Project identity is observed, not declared** — a process's project is recovered from its cwd (+ marker walkup), with no per-service instrumentation. See [ADR 0001](docs/adr/0001-group-by-project.md).
 
 ## Agent inspection
 
@@ -36,41 +37,86 @@ sorting. The system memory header is shared with the full CLI.
 ┌─────────────┐
 │  sysinfo    │──── all processes (pid, name, cmdline, RSS, cwd) ─┐
 └─────────────┘                                                   │
-                                                                  ▼
+┌─────────────┐                                                   │
+│  lsof -d cwd│──── backfills cwd where sysinfo omits ──►         │
+└─────────────┘    (one call, ≈0.14s)                             ▼
 ┌─────────────┐                                          ┌──────────────────┐
-│  footprint  │──── cmp/swp for PIDs with RSS≥5MB ──────► │ ProcessMemory    │
-└─────────────┘    (parallel batches of 20×4)            │ rss, cmp/swp, cwd │
-┌─────────────┐    (one call, ≈0.14s)                    └──────┬───────────┘
-│  lsof -d cwd│──── backfills cwd where sysinfo omits ──►       │
-└─────────────┘                                                 │
-┌──────────────┐                                                │
-│  vm_stat +   │──── system RAM breakdown ──────────────────────┤
-│  sysctl      │    (App, Wired, Compressed, Cache, Disk swap)   │
-└──────────────┘                                                │
+│  footprint  │──── one call per PID ───────────────────► │ ProcessMemory    │
+│  --pid N    │    (one call per core at a time)          │ rss, deep, cwd   │
+└─────────────┘                                          └──────┬───────────┘
                                                                 ▼
                                                   ┌────────────────────────┐
                                                   │ group_processes(mode)  │
                                                   │   App │ Project        │
-                                                  └────────────────────────┘
+                                                  └──────┬─────────────────┘
+┌─────────────┐                                          │ multi-process PID sets
+│  footprint  │◄──── one call per group PID set ─────────┘ (deduplicated across modes)
+│  --pid A..Z │──── GroupDeep by PID set ──► AppGroup.deep
+└─────────────┘    (two calls at a time)
+┌──────────────┐
+│  vm_stat +   │──── system RAM breakdown (App, Wired, Compressed, Cache, Disk swap)
+│  sysctl      │
+└──────────────┘
 ```
 
-## Why not vmmap?
+`footprint.rs` runs one invocation for one PID set and returns the set's
+`total footprint`, `summary.total.swapped`, and the PIDs present in the
+output. `deep.rs` owns the measurement states, the worker pools, and group
+resolution:
 
-`vmmap -summary` reports "Physical footprint" which includes:
-- **IOAccelerator** (GPU backing stores) — shared across all renderer tabs
-- **app-specific tag 16** (GPU compositing) — same
-- **Clean __TEXT** pages — the executable binary mapped into every process
+- `measure_processes` — every PID alone. A call whose output is not exactly
+  that PID is `Unavailable`.
+- `measure_group` — one call over every member, whatever the per-process
+  calls returned. `footprint` exits 0 and omits PIDs it cannot read, so the
+  PIDs in this call's output decide coverage: all members `Measured`, some
+  `Partial` with the measured count, none or a failed call `Unavailable`.
+- `AppGroup::resolve_deep` — one-process groups take their process value;
+  multi-process groups look up their PID set, staying `Pending` until the
+  scan settles and `Unavailable` afterwards.
 
-For a browser with 100 renderer processes sharing 100 MB of GPU textures, a group can sum the same 100 MB allocation 100 times.
+The CLI (`measure_cli`) measures processes, then the multi-process groups of
+the requested mode from that same list. It drops no observed PID, so a row's
+membership, its group call and its coverage agree with the TUI. `--quick`
+keeps its RSS-only list. The TUI background scan streams process results in batches, then group
+results for the visible mode and the other mode. Each event carries a scan id
+so results from an older scan are ignored.
 
-sysinfo's RSS only counts pages resident in RAM per process, which matches Activity Monitor and is a much more honest number.
+## Why one call per set
+
+Apple's tool deduplicates within the PIDs of one invocation (`man footprint`).
+Its JSON lists per-process `categories` with memory private to that process
+inside the set, a `shared` list, a per-process `footprint` ledger, and the
+set's `summary` and `total footprint`. Only the set totals count shared memory
+once:
+
+- Adding per-process ledgers counts shared memory once per process. For 56
+  Opera processes this gave 35.1 GiB; the set total was 12.9 GiB.
+- Adding per-process categories leaves out memory shared inside the set, and
+  the result depends on which other PIDs were in the same call. Memo 0.4.0
+  did this over machine-wide batches of 20 PIDs.
+- The `shared` entries are not additive: added to the categories, they come
+  close to the ledger total again.
+
+A controlled check mapped one 32 MiB dirty region into two processes. Summed
+RSS rose by 64 MiB and the two-PID footprint by 32 MiB. The real-footprint
+unit test in `footprint.rs` repeats this with a 64 MiB region.
+
+Footprint values are dirty memory; clean file-backed pages such as shared
+`__TEXT` are not included. Memory a group shares with processes outside the
+group (for example IOSurface buffers shared with WindowServer) still counts in
+the group.
 
 ## Process counters and system disk swap
 
-The `footprint` counter includes pages compressed in RAM as well as pages
-swapped out. System disk swap measures a different quantity, so the two values
-are reported independently. Deep scans cover processes with RSS of at least
-5 MB when `footprint` can read them.
+The `footprint` compressed or swapped value includes pages compressed in RAM
+as well as pages swapped out, at their uncompressed size. System disk swap
+measures a different quantity, so the two values are reported independently.
+`footprint` gives no per-process or per-group split between the compressor
+and disk, and no physical size of the compressed pages.
+
+The CLI and TUI summaries report RSS as a sum and give footprint coverage as
+counts (read / unavailable). They do not add footprint values across rows:
+memory shared between rows would count more than once.
 
 ## Process grouping rules
 
@@ -139,7 +185,7 @@ Memo reports an error when that operation is unavailable.
 `App.group_mode: GroupMode { App, Project }` selects the grouping key. `Tab`
 toggles it and regroups from the already-scanned `all_processes` (no re-fetch).
 
-Columns are `NAME | PROCS | BRIDGE | RSS | CMP/SWP | TOTAL`. The bridge column
+Columns are `NAME | PROCS | BRIDGE | ΣRSS | CMP/SWP | FOOTPRINT`. The bridge column
 carries the *other* view's key — runtime breakdown in Project mode, distinct
 project count in App mode — so switching views loses no information. It
 replaces the old `THREADS` column (sysinfo 0.33 doesn't expose thread counts,

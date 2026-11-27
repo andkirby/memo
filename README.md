@@ -7,13 +7,18 @@ project spins up → one row).
 <img width="896" height="287" alt="image" src="https://github.com/user-attachments/assets/0ace5bf9-e729-43dd-afcd-16901e280df3" />
 
 ```
-PROJECT                         PROCS  RUNTIMES                 RSS       COMPRESSED OR SWAPPED  TOTAL
-──────────────────────────────────────────────────────────────────────────────────────────────────────────
-~/home/self-calendar            23     node:15 bun:3 pi:3 zsh:2  1.2G      1.8G                   3.0G
-~/home/markdown-ticket          31     bash:8 sleep:8 node:2 …  0.4G      0.6G                   1.0G
-Opera                           37     (app)                     3.4G      4.9G                   8.3G
-Telegram                        1      (app)                     191.0M    171.5M                 362.5M
+PROJECT                        PROCS   BREAKDOWN                RSS SUM      COMPRESSED OR SWAPPED FOOTPRINT
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+Opera                          59                               5.9G         13.6G                 14.5G
+~/home/self-calendar           23      node:15 bun:3 pi:3 zsh:2 1.2G         1.8G                  2.6G
+~/home/markdown-ticket         31      bash:8 sleep:8 node:2 …  412.0M       610.3M                842.9M
+Telegram                       1                                191.0M       171.5M                362.5M
 ```
+
+FOOTPRINT is Apple's `footprint` for the row's processes as one set: memory
+they share counts once. COMPRESSED OR SWAPPED is the part of it that is
+compressed in RAM or swapped to disk. RSS SUM adds each process's resident
+memory, so shared pages count once per process.
 
 ## Why
 
@@ -81,9 +86,9 @@ memo --cli --quick
 memo --cli --quick --group project --sort name
 
 # Full-scan sort options (also apply to app and project groups)
-memo --cli --sort rss     # by resident memory
-memo --cli --sort swap    # by compressed or swapped pages
-memo --cli --sort total   # by total (default)
+memo --cli --sort rss     # by resident memory (RSS SUM for groups)
+memo --cli --sort swap    # by compressed or swapped memory
+memo --cli --sort total   # by footprint (default; `footprint` also works)
 memo --cli --sort name    # alphabetically
 
 # Agent queries — current project, RSS only
@@ -96,8 +101,8 @@ memo --version           # also: memo -v
 ```
 
 `--quick` defaults to RSS descending and also accepts `--sort name`.
-The process table omits compressed or swapped bytes and totals. The system
-memory header still reports disk swap. Combine `--cli --quick` with `--ps`
+The process table omits the footprint columns. The system memory header
+still reports disk swap. Combine `--cli --quick` with `--ps`
 for an ungrouped RSS-only list.
 
 See [Agent inspection](docs/agent-inspection.md) for scope rules, JSON fields,
@@ -115,8 +120,8 @@ project processes are matched by their observed working directories.
 | `x` | Expand selected group or open a confirmation for the selected process |
 | `y` in confirmation | Send SIGKILL to the displayed process |
 | `n` or `Esc` in confirmation | Cancel |
-| `R` | Refresh (full rescan) |
-| `T` / `P` / `S` / `N` | Sort by Total / RSS / Compressed or swapped / Name |
+| `R` | Refresh (full rescan, once the current deep scan has finished) |
+| `T` / `P` / `S` / `N` | Sort by Footprint / RSS / Compressed or swapped / Name |
 | `q` | Quit from the table or close a dialog |
 | `Esc` in details | Close details |
 | Mouse scroll | Navigate |
@@ -136,20 +141,60 @@ On older versions without it, Memo reports that termination is unavailable.
 | Data | Source | Why |
 |---|---|---|
 | **RSS** (resident memory) | `sysinfo` crate | Resident bytes per process |
-| **Compressed or swapped** (`CMP/SWP` in the TUI) | macOS `footprint` tool | Per-process pages compressed or swapped out by the kernel |
+| **Footprint** and **compressed or swapped** (`CMP/SWP` in the TUI) | macOS `footprint` tool | Dirty memory of a PID set, with memory shared inside the set counted once |
 | **cwd** (working dir) | `sysinfo` + one bulk `lsof -d cwd` | Resolves each process to its project (marker walkup) |
 | **System RAM** | `vm_stat` + `sysctl` | Breakdown: App / Wired / Compressed / Cache |
 | **Disk swap** | `sysctl vm.swapusage` | System-wide disk swap usage |
 
-It does **not** use `vmmap`'s "Physical Footprint" because that metric includes GPU backing stores (IOSurface) and shared `__TEXT` pages that are shared across processes. Summing those across grouped processes produces impossible numbers (e.g., 35 GB for Opera on a 16 GB machine).
+### Footprint per row
+
+One `footprint` call measures one set of PIDs. Within that set Apple counts
+memory shared by several processes once (see `man footprint`). Memo reads the
+set's `total footprint` and its compressed or swapped part
+(`summary.total.swapped`). Apple's JSON names that key `swapped`, but it
+covers pages in the compressor as well as pages on disk.
+
+- **Process rows** (`--ps`, expanded TUI rows, the detail popup) use one call
+  for that PID alone. Memory the process shares with others is included in
+  full.
+- **Group rows** with several processes use one call for exactly the group's
+  PIDs, including processes `footprint` could not read alone. Shared memory
+  counts once, so a group can be smaller than the sum of its process rows.
+- **One-process groups** reuse the process call.
+
+Adding per-process values would count shared memory once per process. On a
+16 GB Mac, Opera's 56 processes added up to 35.1 GiB this way, while one
+call over the same PIDs returned 12.9 GiB. Memo never adds footprint values
+across processes, and the result does not depend on how PIDs are batched.
+
+Memory a group shares with processes outside the group, such as graphics
+buffers shared with WindowServer, still counts in the group.
+
+A group row's coverage comes from its own call. `footprint` leaves PIDs it
+cannot read (root processes, exited processes) out of its output and still
+exits successfully, so Memo compares the PIDs in the output with the row's
+members. All of them: the value is complete. Some: the cell shows `≥`, the
+footprint of the readable subset, a lower bound. None: `n/a`. A process that
+fails alone but is read in the group call does not make the row partial.
+`0B` is a real measurement. In the TUI, `…` marks a value still being
+measured. The CLI summary also counts complete, `≥` and `n/a` rows;
+"footprint read" counts processes measured alone.
 
 ### Scan pipeline
 
 1. **System memory** — `vm_stat` + `sysctl` (instant)
 2. **Process list** — `sysinfo` for all processes with RSS + cmdline + cwd (fast); one bulk `lsof -d cwd` call backfills cwd where sysinfo omits it
-3. **Compressed or swapped pages** — `footprint` in parallel batches for processes with RSS ≥ 5 MB
+3. **Each process alone** — one `footprint --pid` call per process, one call per CPU core at a time
+4. **Each multi-process group** — one `footprint` call over the group's PIDs, two at a time. The CLI measures the requested grouping. The TUI measures the visible grouping first, then the other one so `Tab` needs no rescan.
 
-Steps 1-2 take <1s. Step 3 takes ~8s for ~350 processes (parallel batches of 20 PIDs × 4 concurrent).
+Steps 1-2 take under 1 s. On a 10-core Mac with about 580 processes, a full
+CLI scan took 16-18 s; the 60-process Opera group call took most of it.
+`--ps` skips step 4, and `--quick` skips steps 3 and 4.
+
+PIDs are passed with `--pid`. `footprint` also reads a bare number, or `-p`,
+as a partial process name, which can select unrelated processes. It exits
+successfully when it cannot read some requested PIDs, so Memo compares the
+PIDs in the output with the request.
 
 ## Architecture
 
@@ -160,7 +205,8 @@ Agent interface: [current contract](docs/agent-inspection.md) and
 src/
 ├── main.rs        CLI parsing, TUI event loop, scan orchestration
 ├── scanner.rs     ProcessMemory, SystemMemory, vm_stat/sysctl parsing
-├── footprint.rs   macOS footprint wrapper for compressed or swapped pages
+├── footprint.rs   macOS footprint wrapper: one call per PID set
+├── deep.rs        Deep measurement states, scheduling, and cell text
 ├── group.rs       Process grouping — App or Project mode (marker walkup on cwd)
 ├── inspect.rs     Project-scoped RSS query: scope, aggregation, text/JSON output
 ├── app.rs         TUI state: navigation, selection, sort, row mapping
@@ -179,10 +225,16 @@ struct ProcessMemory {
     cmdline: String,
     cwd: String,   // from sysinfo (+ lsof fallback) — used for project grouping
     rss: u64,      // from sysinfo — pages in RAM right now
-    compressed_or_swapped: u64, // from footprint
+    deep: ProcessDeep, // Pending | Unavailable | Measured { footprint, compressed_or_swapped }
     threads: usize,
 }
-// total() = rss + compressed_or_swapped
+
+struct AppGroup {
+    processes: Vec<ProcessMemory>,
+    total_rss: u64, // sum of member RSS
+    deep: GroupDeep, // Pending | Unavailable | Measured | Partial (lower bound)
+    // ...
+}
 ```
 
 ### Process grouping
@@ -217,14 +269,19 @@ Rules (App mode):
 | Cached Files | 1.83 GB | ~1.5 GB | File-backed pages (close) |
 | Disk swap | 6.70 GB | matches | Same `sysctl vm.swapusage` source |
 
-The per-process RSS column uses resident memory, as in `ps aux`.
-Apple's `footprint` counter includes pages compressed in RAM, so it can be
-nonzero even when system disk swap is zero.
+The per-process RSS column uses resident memory, as in `ps aux`. A process's
+footprint matched `top`'s MEM column in our checks. Activity Monitor shows
+one value per process and no group total, so adding its Memory column counts
+shared memory more than once.
 
-The displayed total adds RSS and the measured compressed or swapped bytes for
-ranking. RSS can count shared pages in multiple processes, and the deep scan
-covers only eligible processes. Actual memory reclaimed on exit depends on which
-pages remain shared or reclaimable.
+Footprint is dirty memory: it leaves out clean pages, such as program code
+read from disk, that macOS can drop and reload. Compressed or swapped memory
+is counted at its uncompressed size, so it can be larger than the RAM it
+occupies, and it can be nonzero when system disk swap is zero. `footprint`
+does not report how much of a process's or group's memory is in the
+compressor and how much is on disk, nor how much physical RAM the compressed
+part takes. Memory freed when a group exits depends on what remains shared
+with other processes.
 
 ## Known limitations
 
@@ -233,7 +290,9 @@ pages remain shared or reclaimable.
 - **Tested on macOS Sonoma (14) only.** Expected to run on macOS 11 Big Sur and later (the arm64 slice requires Apple Silicon, i.e. 11+ anyway). The Intel slice is **cross-compiled in CI and not run-tested on Intel hardware** — it should work, but treat it as best-effort.
 - **Intel is end-of-life.** macOS 26 Tahoe (Sept 2025) is the last release supporting Intel Macs; its successor (Golden Gate, fall 2026) is Apple-Silicon-only. The `memo-macos-x86_64` build targets that shrinking tail.
 - **Compressed memory gap** — Activity Monitor shows more compressed memory than our `vm_stat` reading. This is because AM uses private `host_statistics64()` API.
-- **Partial deep-scan coverage** — processes with RSS below 5 MB are skipped, and some eligible processes may be inaccessible. Totals include the bytes from successful measurements.
+- **Unreadable processes** — without root, `footprint` cannot read some processes (mostly root daemons). They show `n/a`, and groups whose call cannot read them show a `≥` lower bound. Every observed process stays in its row and in its group's call, including processes with no RSS reading, so `--ps` lists them as `0B` RSS and `n/a`. `--quick` still lists only processes with RSS.
+- **Scan time** — group calls on large multi-process apps take seconds each (about 12 s for 60 Opera processes on a 10-core Mac).
+- **Point in time** — each `footprint` call is a separate sample. Values in different rows, and a group and its process rows, come from slightly different moments.
 
 ## License
 

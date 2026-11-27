@@ -53,7 +53,9 @@ fn quick_cli_skips_footprint_and_rejects_unavailable_sorts() {
                 line.starts_with("APP ") || line.starts_with("PROJECT ") || line.starts_with("PID ")
             })
             .expect("process table header");
-        assert!(header.trim_end().ends_with("RSS"), "{header}");
+        // Grouped RSS is a sum over member processes.
+        let rss_header = if header.starts_with("PID ") { "RSS" } else { "RSS SUM" };
+        assert!(header.trim_end().ends_with(rss_header), "{header}");
         assert!(
             !marker.exists(),
             "quick scan invoked footprint for {flags:?}"

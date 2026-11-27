@@ -4,6 +4,38 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [0.4.1] - 2026-11-27
+
+### Fixed
+
+- App and project rows measure memory with one `footprint` call over exactly
+  the row's processes, so memory they share counts once. Memo 0.4.0 added
+  per-process values from machine-wide batches of 20 PIDs; this left out
+  memory shared inside a batch and changed with batch membership.
+- PIDs are passed to `footprint` with `--pid`. A bare number could match an
+  unrelated process by name.
+- Processes and groups that `footprint` cannot read show `n/a`, and groups
+  measured from only some of their processes show a `≥` lower bound, instead
+  of counting as zero. Rows without a value sort last.
+- A group's call includes every member, also processes with no RSS reading
+  or that `footprint` could not read alone, and its coverage comes from the
+  PIDs that call returns. The CLI keeps every observed process, so CLI and
+  TUI rows have the same members and coverage.
+- Process rows, `--ps`, and the detail popup show each process measured
+  alone.
+
+### Changed
+
+- The TOTAL column (RSS plus compressed or swapped) is replaced by FOOTPRINT,
+  Apple's dirty footprint of the row. `--sort total` and `T` sort by it;
+  `--sort footprint` is also accepted.
+- Group RSS is labeled RSS SUM in the CLI and ΣRSS in the TUI. Summaries
+  report footprint coverage instead of adding footprint values across rows.
+- The deep scan measures every process, without the 5 MB RSS threshold, and
+  takes longer: about 16-18 s on a 10-core Mac with 580 processes.
+  `--quick` and `memo inspect` still skip `footprint`.
+- The TUI refresh key waits for the current deep scan to finish.
+
 ## [0.4.0] - 2026-11-24
 
 ### Added

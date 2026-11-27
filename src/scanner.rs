@@ -1,11 +1,12 @@
+use crate::deep::ProcessDeep;
 use crate::termination::ProcessIdentity;
 use std::collections::HashMap;
 use std::process::Command;
 
 // ─── Process memory — single source of truth ──────────────────────────────
 //
-// Total is a ranking metric: RSS plus measured compressed or swapped bytes.
-// RSS can include shared pages, and the deep scan covers a subset of processes.
+// RSS comes from sysinfo and counts resident pages, including pages shared
+// with other processes. `deep` is Apple's footprint for this process alone.
 
 #[derive(Debug, Clone)]
 pub struct ProcessMemory {
@@ -15,13 +16,17 @@ pub struct ProcessMemory {
     pub cmdline: String,
     pub cwd: String,    // from sysinfo (+ lsof fallback) — used for project grouping
     pub rss: u64,       // resident memory from sysinfo
-    pub compressed_or_swapped: u64, // from footprint, includes pages compressed in RAM
+    pub deep: ProcessDeep, // footprint of this PID alone
     pub threads: usize,
 }
 
 impl ProcessMemory {
-    pub fn total(&self) -> u64 {
-        self.rss.saturating_add(self.compressed_or_swapped)
+    pub fn footprint(&self) -> Option<u64> {
+        self.deep.memory().map(|m| m.footprint)
+    }
+
+    pub fn compressed_or_swapped(&self) -> Option<u64> {
+        self.deep.memory().map(|m| m.compressed_or_swapped)
     }
 
     pub fn new(pid: i32, name: String, rss: u64) -> Self {
@@ -32,7 +37,7 @@ impl ProcessMemory {
             cmdline: String::new(),
             cwd: String::new(),
             rss,
-            compressed_or_swapped: 0,
+            deep: ProcessDeep::Pending,
             threads: 1,
         }
     }

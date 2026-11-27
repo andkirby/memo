@@ -1,3 +1,4 @@
+use crate::deep::{GroupDeep, GroupKey, group_key};
 use crate::scanner::ProcessMemory;
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -25,20 +26,45 @@ pub struct AppGroup {
     pub name: String,
     pub kind: GroupKind,
     pub processes: Vec<ProcessMemory>,
+    /// Sum of member RSS. Pages shared by members count once per member.
     pub total_rss: u64,
-    pub total_compressed_or_swapped: u64,
+    /// Apple's footprint for exactly this group's PIDs (shared memory once).
+    pub deep: GroupDeep,
     pub thread_count: usize,
 }
 
 impl AppGroup {
-    pub fn total(&self) -> u64 {
-        self.total_rss.saturating_add(self.total_compressed_or_swapped)
+    /// The group's PID set, the identity of its deep measurement.
+    pub fn key(&self) -> GroupKey {
+        group_key(self.processes.iter().map(|p| p.pid))
+    }
+
+    pub fn footprint(&self) -> Option<u64> {
+        self.deep.memory().map(|m| m.footprint)
+    }
+
+    pub fn compressed_or_swapped(&self) -> Option<u64> {
+        self.deep.memory().map(|m| m.compressed_or_swapped)
+    }
+
+    /// Set `deep` from finished measurements. A one-process group is that
+    /// process's own measurement. A missing multi-process entry is pending
+    /// until the scan settles, then unavailable.
+    pub fn resolve_deep(&mut self, groups: &HashMap<GroupKey, GroupDeep>, settled: bool) {
+        self.deep = match self.processes.as_slice() {
+            [only] => GroupDeep::from_process(only.deep),
+            _ => groups.get(&self.key()).copied().unwrap_or(if settled {
+                GroupDeep::Unavailable
+            } else {
+                GroupDeep::Pending
+            }),
+        };
     }
 
     fn recalc(&mut self) {
         self.total_rss = self.processes.iter().map(|p| p.rss).sum();
-        self.total_compressed_or_swapped = self.processes.iter().map(|p| p.compressed_or_swapped).sum();
         self.thread_count = self.processes.iter().map(|p| p.threads).sum();
+        self.resolve_deep(&HashMap::new(), false);
     }
 
     /// The bridge column as sorted (family, count) tokens — for width-aware rendering.
@@ -246,8 +272,9 @@ fn shorten_in(path: &str, home: &str) -> String {
 
 // ─── Grouping ──────────────────────────────────────────────────────────────
 
-/// Group processes by `mode`, sorted by the displayed total descending.
-/// Grouping is a pure function of the process list — no hidden state.
+/// Group processes by `mode`, sorted by RSS sum descending. Callers apply
+/// deep measurements with `AppGroup::resolve_deep` and then sort by the
+/// active column. Grouping is a pure function of the process list.
 pub fn group_processes(processes: &[ProcessMemory], mode: GroupMode) -> Vec<AppGroup> {
     group_processes_in(processes, mode, &home_dir())
 }
@@ -273,15 +300,34 @@ fn group_processes_in(processes: &[ProcessMemory], mode: GroupMode, home: &str) 
             let name = if kind == GroupKind::Project { shorten_in(&key, home) } else { key };
             let mut g = AppGroup {
                 name, kind, processes: procs,
-                total_rss: 0, total_compressed_or_swapped: 0, thread_count: 0,
+                total_rss: 0, deep: GroupDeep::Pending, thread_count: 0,
             };
             g.recalc();
             g
         })
         .collect();
 
-    result.sort_by(|a, b| b.total().cmp(&a.total()));
+    result.sort_by(|a, b| b.total_rss.cmp(&a.total_rss).then_with(|| a.name.cmp(&b.name)));
     result
+}
+
+/// PID sets of every multi-process group in `modes`, largest RSS first,
+/// without duplicates. One-process groups reuse the per-process call.
+pub fn multi_process_keys(processes: &[ProcessMemory], modes: &[GroupMode]) -> Vec<GroupKey> {
+    multi_process_keys_in(processes, modes, &home_dir())
+}
+
+fn multi_process_keys_in(processes: &[ProcessMemory], modes: &[GroupMode], home: &str) -> Vec<GroupKey> {
+    let mut seen = std::collections::HashSet::new();
+    let mut keys = Vec::new();
+    for mode in modes {
+        for g in group_processes_in(processes, *mode, home) {
+            if g.processes.len() > 1 && seen.insert(g.key()) {
+                keys.push(g.key());
+            }
+        }
+    }
+    keys
 }
 
 #[cfg(test)]
@@ -310,8 +356,51 @@ mod tests {
     fn pm_cwd(pid: i32, name: &str, rss: u64, cwd: &str, cmdline: &str) -> ProcessMemory {
         ProcessMemory {
             pid, name: name.into(), cmdline: cmdline.into(), cwd: cwd.into(),
-            termination_identity: None, rss, compressed_or_swapped: 0, threads: 1,
+            termination_identity: None, rss, deep: Default::default(), threads: 1,
         }
+    }
+
+    #[test]
+    fn group_deep_comes_from_its_own_set_not_member_sums() {
+        use crate::deep::ProcessDeep;
+        use crate::footprint::Memory;
+        let m = |footprint| Memory { footprint, compressed_or_swapped: footprint / 2 };
+        let mut a = pm(1, "Opera", 100);
+        a.deep = ProcessDeep::Measured(m(40));
+        let mut b = pm(2, "Opera Helper (Renderer)", 100);
+        b.deep = ProcessDeep::Measured(m(40));
+        let mut c = pm(3, "Telegram", 10);
+        c.deep = ProcessDeep::Unavailable;
+        let mut groups = group_processes(&[a, b, c], GroupMode::App);
+
+        let opera = groups.iter_mut().find(|g| g.name == "Opera").unwrap();
+        assert_eq!(opera.key(), vec![1, 2]);
+        assert_eq!(opera.deep, GroupDeep::Pending, "multi-process groups wait for their own call");
+        let measured = HashMap::from([(vec![1, 2], GroupDeep::Measured(m(50)))]);
+        opera.resolve_deep(&measured, true);
+        assert_eq!(opera.footprint(), Some(50), "group value, not 40 + 40");
+        opera.resolve_deep(&HashMap::new(), true);
+        assert_eq!(opera.deep, GroupDeep::Unavailable, "settled without a value is unavailable");
+
+        let telegram = groups.iter().find(|g| g.name == "Telegram").unwrap();
+        assert_eq!(telegram.deep, GroupDeep::Unavailable, "not zero");
+        assert_eq!(telegram.footprint(), None);
+    }
+
+    #[test]
+    fn multi_process_keys_cover_both_modes_once() {
+        let home = fake_home();
+        fs::create_dir_all(format!("{}/proj", home)).unwrap();
+        fs::write(format!("{}/proj/.git", home), "").unwrap();
+        let cwd = format!("{}/proj", home);
+        let procs = [
+            pm_cwd(1, "node", 10, &cwd, "node a"),
+            pm_cwd(2, "node", 30, &cwd, "node b"),
+            pm_cwd(3, "bun", 20, &cwd, "bun c"),
+            pm_cwd(4, "Slack", 5, "/", ""),
+        ];
+        let keys = multi_process_keys_in(&procs, &[GroupMode::Project, GroupMode::App], &home);
+        assert_eq!(keys, vec![vec![1, 2, 3], vec![1, 2]], "project row, then the node row; singles skipped");
     }
 
     #[test]

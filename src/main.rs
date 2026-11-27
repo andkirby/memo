@@ -1,4 +1,5 @@
 mod app;
+mod deep;
 mod footprint;
 mod group;
 mod inspect;
@@ -19,7 +20,8 @@ use std::{
 };
 
 use anyhow::Result;
-use app::{App, ProcessDetail, SortColumn};
+use app::{App, DeepPhase, DeepProgress, ProcessDetail, SortColumn};
+use deep::{GroupDeep, GroupKey, Metric, ProcessDeep};
 use clap::{CommandFactory, Parser, Subcommand, error::ErrorKind};
 use crossterm::{
     event::{
@@ -54,7 +56,8 @@ struct Args {
     #[arg(long)]
     ps: bool,
 
-    /// Sort by total (default), rss, swap (compressed or swapped), or name.
+    /// Sort by total (default: Apple footprint), rss, swap (compressed or
+    /// swapped), or name. `footprint` is accepted for total.
     /// With --quick, use rss (default) or name.
     #[arg(long)]
     sort: Option<String>,
@@ -73,11 +76,18 @@ impl Args {
             (_, Some("rss")) | (true, None) => Ok(SortColumn::Physical),
             (_, Some("name")) => Ok(SortColumn::Name),
             (false, Some("swap")) => Ok(SortColumn::CompressedOrSwapped),
-            (false, _) => Ok(SortColumn::Total),
+            (false, _) => Ok(SortColumn::Footprint),
             (true, Some(value)) => Err(Self::command().error(
                 ErrorKind::InvalidValue,
                 format!("--sort {value} is unavailable with --quick. Use rss or name."),
             )),
+        }
+    }
+
+    fn group_mode(&self) -> group::GroupMode {
+        match self.group.as_str() {
+            "project" => group::GroupMode::Project,
+            _ => group::GroupMode::App,
         }
     }
 }
@@ -102,12 +112,15 @@ enum Command {
 
 // ─── Scan events (background → main thread) ────────────────────────────────
 
+// Scan events carry the scan id; the TUI drops events from an older scan.
 enum ScanEvent {
     SystemMemory(scanner::SystemMemory),
-    Processes(Vec<ProcessMemory>),
-    CompressedOrSwappedBatch(HashMap<i32, u64>), // pid → compressed or swapped bytes
+    Processes(u64, Vec<ProcessMemory>),
+    Progress(u64, DeepProgress),
+    ProcessDeep(u64, Vec<(i32, ProcessDeep)>, DeepProgress),
+    GroupDeep(u64, GroupKey, GroupDeep, DeepProgress),
     DetailResult(ProcessDetail),
-    Done,
+    Done(u64),
 }
 
 // ─── Entry point ────────────────────────────────────────────────────────────
@@ -168,28 +181,48 @@ fn run_cli(args: Args, sort: SortColumn) -> io::Result<()> {
     // Collect processes via sysinfo
     writeln!(out, "Scanning processes...")?;
     let mut processes = collect_processes(false);
+    let mut group_measurements = HashMap::new();
 
+    // Quick keeps its RSS-only contract. The deep scan keeps every observed
+    // PID: a process footprint cannot read still belongs to its row, and the
+    // row's group call decides that row's coverage.
     if args.quick {
         writeln!(out, "RSS-only process scan.")?;
+        processes.retain(|p| p.rss > 0);
     } else {
-        writeln!(out, "Deep analysis (compressed or swapped via footprint)...")?;
-        let rss_threshold = 5 * 1024 * 1024u64;
-        let big_pids: Vec<i32> = processes.iter()
-            .filter(|p| p.rss >= rss_threshold).map(|p| p.pid).collect();
-        writeln!(out, "Deep-scanning {} processes (skipped {} tiny)...",
-            big_pids.len(), processes.len() - big_pids.len())?;
-
-        let compressed_or_swapped = scan_compressed_or_swapped(&big_pids);
-        for p in &mut processes {
-            if let Some(bytes) = compressed_or_swapped.get(&p.pid) {
-                p.compressed_or_swapped = *bytes;
-            }
-        }
+        writeln!(out, "Measuring {} processes with footprint: one call per process, \
+            then one per multi-process row...", processes.len())?;
+        out.flush()?;
+        let mode = (!args.ps).then(|| args.group_mode());
+        group_measurements = measure_cli(&mut processes, mode, &footprint::measure_set);
     }
 
-    processes.retain(|p| p.total() > 0);
+    write_process_table(&mut out, &args, sort, processes, &group_measurements)
+}
 
-    write_process_table(&mut out, &args, sort, processes)
+/// Measure every process alone, then, when `mode` is set, each multi-process
+/// group of that mode as one set over all of its members.
+fn measure_cli(
+    processes: &mut [ProcessMemory],
+    mode: Option<group::GroupMode>,
+    measure: &deep::Measurer<'_>,
+) -> HashMap<GroupKey, GroupDeep> {
+    let pids: Vec<i32> = processes.iter().map(|p| p.pid).collect();
+    let mut standalone = HashMap::new();
+    deep::measure_processes(&pids, deep::process_jobs(), measure, |pid, d| {
+        standalone.insert(pid, d);
+    });
+    for p in processes.iter_mut() {
+        p.deep = standalone.get(&p.pid).copied().unwrap_or(ProcessDeep::Unavailable);
+    }
+    let mut groups = HashMap::new();
+    if let Some(mode) = mode {
+        let keys = group::multi_process_keys(processes, &[mode]);
+        deep::measure_groups(&keys, deep::GROUP_JOBS, measure, |key, d| {
+            groups.insert(key.clone(), d);
+        });
+    }
+    groups
 }
 
 fn write_system_memory(out: &mut impl Write, sys_mem: &scanner::SystemMemory) -> io::Result<()> {
@@ -210,26 +243,34 @@ fn write_process_table(
     args: &Args,
     sort: SortColumn,
     mut processes: Vec<ProcessMemory>,
+    group_measurements: &HashMap<GroupKey, GroupDeep>,
 ) -> io::Result<()> {
     let descending = sort != SortColumn::Name;
-    let extra_columns = if args.quick { "" } else { " COMPRESSED OR SWAPPED TOTAL" };
+    let extra_columns = if args.quick { "" } else { " COMPRESSED OR SWAPPED FOOTPRINT" };
     if args.ps {
-        processes.sort_by(|a, b| sort.compare_processes(a, b, descending));
+        processes.sort_by(|a, b| sort.compare_processes(a, b, descending).then_with(|| a.pid.cmp(&b.pid)));
         writeln!(out, "{:<8} {:<35} {:<12}{}", "PID", "NAME", "RSS", extra_columns)?;
         writeln!(out, "{}", "─".repeat(if args.quick { 57 } else { 92 }))?;
         for p in &processes {
             write!(out, "{:<8} {:<35} {:<12}", p.pid, truncate(&p.name, 35), format_size(p.rss))?;
-            write_deep_scan_columns(out, args.quick, p.compressed_or_swapped, p.total())?;
+            write_deep_scan_columns(out, args.quick, deep::GroupDeep::from_process(p.deep))?;
+        }
+        if !args.quick {
+            writeln!(out)?;
+            let (measured, unavailable) = coverage(&processes);
+            writeln!(out, "{} processes • footprint read {} • unavailable {}",
+                processes.len(), measured, unavailable)?;
+            writeln!(out, "COMPRESSED OR SWAPPED and FOOTPRINT measure each process alone; \
+                memory shared with other processes is included in each.")?;
+            writeln!(out, "n/a: footprint could not read the process (root processes need sudo).")?;
         }
     } else {
-        let mode = match args.group.as_str() {
-            "project" => group::GroupMode::Project,
-            _ => group::GroupMode::App,
-        };
+        let mode = args.group_mode();
         let mut groups = group::group_processes(&processes, mode);
-        if sort != SortColumn::Total {
-            groups.sort_by(|a, b| sort.compare_groups(a, b, descending));
+        for g in &mut groups {
+            g.resolve_deep(group_measurements, true);
         }
+        groups.sort_by(|a, b| sort.compare_groups(a, b, descending));
         let total_procs: usize = groups.iter().map(|g| g.processes.len()).sum();
         let (noun, noun_pl) = match mode {
             group::GroupMode::Project => ("PROJECT", "projects"),
@@ -237,39 +278,53 @@ fn write_process_table(
         };
 
         writeln!(out, "{:<30} {:<7} {:<24} {:<12}{}",
-            noun, "PROCS", "BREAKDOWN", "RSS", extra_columns)?;
+            noun, "PROCS", "BREAKDOWN", "RSS SUM", extra_columns)?;
         writeln!(out, "{}", "─".repeat(if args.quick { 76 } else { 112 }))?;
         for g in &groups {
             write!(out, "{:<30} {:<7} {:<24} {:<12}",
                 truncate(&g.name, 30), g.processes.len(), truncate(&g.bridge(mode), 24),
                 format_size(g.total_rss))?;
-            write_deep_scan_columns(out, args.quick, g.total_compressed_or_swapped, g.total())?;
+            write_deep_scan_columns(out, args.quick, g.deep)?;
         }
 
         writeln!(out)?;
         let sum_rss: u64 = groups.iter().map(|g| g.total_rss).sum();
         write!(
             out,
-            "{} {} • {} processes • {} RSS",
+            "{} {} • {} processes • {} RSS sum",
             groups.len(), noun_pl, total_procs, format_size(sum_rss),
         )?;
         if !args.quick {
-            let bytes = groups.iter().map(|g| g.total_compressed_or_swapped).sum();
-            write!(out, " • {} compressed or swapped", format_size(bytes))?;
+            let (measured, unavailable) = coverage(&processes);
+            write!(out, " • footprint read {} • unavailable {}", measured, unavailable)?;
+            let partial = groups.iter().filter(|g| matches!(g.deep, GroupDeep::Partial { .. })).count();
+            let missing = groups.iter().filter(|g| g.deep == GroupDeep::Unavailable).count();
+            writeln!(out)?;
+            write!(out, "Rows: {} complete • {} lower bound (≥) • {} n/a",
+                groups.len() - partial - missing, partial, missing)?;
         }
         writeln!(out)?;
+        writeln!(out, "RSS SUM adds member RSS, so pages shared by members count once per process.")?;
+        if !args.quick {
+            writeln!(out, "COMPRESSED OR SWAPPED and FOOTPRINT: one footprint call over all of a row's \
+                processes; memory shared inside the row counts once.")?;
+            writeln!(out, "≥: lower bound, that call could not read some processes in the row. \
+                n/a: it read none. \"footprint read\" counts processes measured alone.")?;
+        }
     }
     Ok(())
 }
 
-fn write_deep_scan_columns(
-    out: &mut impl Write,
-    quick: bool,
-    compressed_or_swapped: u64,
-    total: u64,
-) -> io::Result<()> {
+fn coverage(processes: &[ProcessMemory]) -> (usize, usize) {
+    let measured = processes.iter().filter(|p| p.deep.memory().is_some()).count();
+    (measured, processes.len() - measured)
+}
+
+fn write_deep_scan_columns(out: &mut impl Write, quick: bool, deep: GroupDeep) -> io::Result<()> {
     if !quick {
-        write!(out, " {:<21} {:<12}", format_size(compressed_or_swapped), format_size(total))?;
+        write!(out, " {:<21} {:<12}",
+            deep::group_cell(deep, Metric::CompressedOrSwapped),
+            deep::group_cell(deep, Metric::Footprint))?;
     }
     writeln!(out)
 }
@@ -285,9 +340,8 @@ fn run_tui() -> Result<()> {
     let mut app = App::new();
     let (tx, rx) = mpsc::channel();
 
-    app.is_loading = true;
-    let tx_scan = tx.clone();
-    thread::spawn(move || perform_scan(tx_scan));
+    let (scan_id, mode, tx_scan) = (app.start_scan(), app.group_mode, tx.clone());
+    thread::spawn(move || perform_scan(tx_scan, scan_id, mode));
 
     let tick_rate = Duration::from_millis(100);
     let mut last_tick = Instant::now();
@@ -367,17 +421,13 @@ fn run_tui() -> Result<()> {
                                 show_detail(&app, &tx);
                             }
                             KeyCode::Char('r') => {
-                                if !app.is_loading {
-                                    app.is_loading = true;
-                                    app.termination_status = None;
-                                    app.groups.clear();
-                                    app.all_processes.clear();
-                                    app.expanded_group = None;
-                                    let tx_scan = tx.clone();
-                                    thread::spawn(move || perform_scan(tx_scan));
+                                // One scan at a time: footprint calls are CPU-heavy.
+                                if !app.is_loading && app.deep_settled {
+                                    let (scan_id, mode, tx_scan) = (app.start_scan(), app.group_mode, tx.clone());
+                                    thread::spawn(move || perform_scan(tx_scan, scan_id, mode));
                                 }
                             }
-                            KeyCode::Char('t') => { app.sort_column = SortColumn::Total; app.sort_desc = true; app.sort_groups(); }
+                            KeyCode::Char('t') => { app.sort_column = SortColumn::Footprint; app.sort_desc = true; app.sort_groups(); }
                             KeyCode::Char('p') => { app.sort_column = SortColumn::Physical; app.sort_desc = true; app.sort_groups(); }
                             KeyCode::Char('s') => { app.sort_column = SortColumn::CompressedOrSwapped; app.sort_desc = true; app.sort_groups(); }
                             KeyCode::Char('n') => { app.sort_column = SortColumn::Name; app.sort_desc = false; app.sort_groups(); }
@@ -397,28 +447,40 @@ fn run_tui() -> Result<()> {
 
         // Process background events
         while let Ok(event) = rx.try_recv() {
+            let current = app.scan_id;
             match event {
                 ScanEvent::SystemMemory(mem) => app.set_system_memory(mem),
-                ScanEvent::Processes(procs) => {
+                ScanEvent::Processes(id, procs) if id == current => {
                     app.set_processes(procs);
                     app.is_loading = false;
                     app.status_message = Some(format!("Quick scan done — {} procs", app.all_processes.len()));
                 }
-                ScanEvent::CompressedOrSwappedBatch(compressed_or_swapped) => {
-                    for p in &mut app.all_processes {
-                        if let Some(bytes) = compressed_or_swapped.get(&p.pid) {
-                            p.compressed_or_swapped = *bytes;
-                        }
+                ScanEvent::Progress(id, progress) if id == current => {
+                    app.deep_scan_progress = Some(progress);
+                }
+                ScanEvent::ProcessDeep(id, results, progress) if id == current => {
+                    app.apply_process_deep(&results);
+                    app.deep_scan_progress = Some(progress);
+                }
+                ScanEvent::GroupDeep(id, key, deep, progress) if id == current => {
+                    app.apply_group_deep(key, deep);
+                    app.deep_scan_progress = Some(progress);
+                }
+                ScanEvent::DetailResult(mut details) => {
+                    // Deep values may have arrived while metadata was loading.
+                    if let Some(p) = app.all_processes.iter().find(|p| p.pid == details.pid) {
+                        details.deep = p.deep;
                     }
-                    app.recalculate_from(&app.all_processes.clone());
-                    app.sort_groups();
+                    app.current_detail = Some(details);
                 }
-                ScanEvent::DetailResult(details) => app.current_detail = Some(details),
-                ScanEvent::Done => {
-                    app.is_loading = false;
-                    app.status_message = Some(format!("Ready — {} apps, {} processes",
-                        app.groups.len(), app.all_processes.len()));
+                ScanEvent::Done(id) if id == current => {
+                    app.finish_deep_scan();
+                    let (measured, unavailable) = app.deep_coverage();
+                    app.status_message = Some(format!(
+                        "Ready — {} processes, footprint read {}, unavailable {}",
+                        app.all_processes.len(), measured, unavailable));
                 }
+                _ => {} // from an older scan
             }
         }
 
@@ -536,40 +598,57 @@ fn fetch_detail_meta(proc: ProcessMemory) -> ProcessDetail {
         name: proc.name,
         cmd, exe, cwd, status, start_time, cpu_usage,
         rss: proc.rss,
-        compressed_or_swapped: proc.compressed_or_swapped,
+        deep: proc.deep,
         parent_pid, parent_cmd,
     }
 }
 
 // ─── Background scan ────────────────────────────────────────────────────────
 
-fn perform_scan(tx: mpsc::Sender<ScanEvent>) {
+fn perform_scan(tx: mpsc::Sender<ScanEvent>, scan_id: u64, mode: group::GroupMode) {
     // 1. System memory
-    let sys_mem = get_system_memory();
-    let _ = tx.send(ScanEvent::SystemMemory(sys_mem));
+    let _ = tx.send(ScanEvent::SystemMemory(get_system_memory()));
 
-    // 2. Collect all processes via sysinfo (fast)
+    // 2. Collect all processes via sysinfo (fast). Later phases use this same
+    //    list, so group PID sets match the rows the TUI builds from it.
     let processes = collect_processes(true);
-    let _ = tx.send(ScanEvent::Processes(processes));
+    let _ = tx.send(ScanEvent::Processes(scan_id, processes.clone()));
 
-    // 3. Deep scan: measure compressed or swapped pages for processes with RSS >= 5 MB
-    let rss_threshold = 5 * 1024 * 1024u64;
-    let big_pids: Vec<i32> = {
-        // Read from the processes we just sent (re-derive from sysinfo since we can't borrow tx data)
-        let mut sys = System::new_all();
-        sys.refresh_all();
-        sys.processes().iter()
-            .filter(|(_, p)| p.memory() >= rss_threshold)
-            .map(|(pid, _)| pid.as_u32() as i32)
-            .collect()
+    // 3. Each process alone, streamed in batches.
+    let pids: Vec<i32> = processes.iter().map(|p| p.pid).collect();
+    let progress = |phase, done, total| DeepProgress { phase, done, total };
+    let _ = tx.send(ScanEvent::Progress(scan_id, progress(DeepPhase::Processes, 0, pids.len())));
+    let mut standalone = HashMap::new();
+    let mut batch = Vec::new();
+    let mut last_sent = Instant::now();
+    deep::measure_processes(&pids, deep::process_jobs(), &footprint::measure_set, |pid, d| {
+        standalone.insert(pid, d);
+        batch.push((pid, d));
+        if batch.len() >= 64 || last_sent.elapsed() >= Duration::from_millis(250)
+            || standalone.len() == pids.len()
+        {
+            let done = progress(DeepPhase::Processes, standalone.len(), pids.len());
+            let _ = tx.send(ScanEvent::ProcessDeep(scan_id, std::mem::take(&mut batch), done));
+            last_sent = Instant::now();
+        }
+    });
+
+    // 4. One call per multi-process group: the visible mode first, then the
+    //    other so Tab needs no new scan.
+    let other = match mode {
+        group::GroupMode::App => group::GroupMode::Project,
+        group::GroupMode::Project => group::GroupMode::App,
     };
+    let keys = group::multi_process_keys(&processes, &[mode, other]);
+    let _ = tx.send(ScanEvent::Progress(scan_id, progress(DeepPhase::Groups, 0, keys.len())));
+    let mut done = 0;
+    deep::measure_groups(&keys, deep::GROUP_JOBS, &footprint::measure_set, |key, d| {
+        done += 1;
+        let _ = tx.send(ScanEvent::GroupDeep(scan_id, key.clone(), d,
+            progress(DeepPhase::Groups, done, keys.len())));
+    });
 
-    let compressed_or_swapped = scan_compressed_or_swapped(&big_pids);
-    if !compressed_or_swapped.is_empty() {
-        let _ = tx.send(ScanEvent::CompressedOrSwappedBatch(compressed_or_swapped));
-    }
-
-    let _ = tx.send(ScanEvent::Done);
+    let _ = tx.send(ScanEvent::Done(scan_id));
 }
 
 // ─── Shared helpers ─────────────────────────────────────────────────────────
@@ -604,30 +683,6 @@ fn collect_processes(record_termination_identities: bool) -> Vec<ProcessMemory> 
     }).collect()
 }
 
-/// Run footprint in parallel batches and return compressed or swapped bytes by PID.
-fn scan_compressed_or_swapped(pids: &[i32]) -> HashMap<i32, u64> {
-    let mut result = HashMap::new();
-    if pids.is_empty() { return result; }
-
-    let chunks: Vec<Vec<i32>> = pids.chunks(20).map(|c| c.to_vec()).collect();
-
-    std::thread::scope(|s| {
-        for batch in chunks.chunks(4) {
-            let handles: Vec<_> = batch.iter()
-                .map(|chunk| s.spawn(|| footprint::get_compressed_or_swapped_for_pids(chunk)))
-                .collect();
-
-            for handle in handles {
-                if let Ok(fp_map) = handle.join().unwrap() {
-                    result.extend(fp_map);
-                }
-            }
-        }
-    });
-
-    result
-}
-
 fn truncate(s: &str, max: usize) -> String {
     if s.len() > max { format!("{}…", &s[..max - 1]) } else { s.to_string() }
 }
@@ -635,55 +690,161 @@ fn truncate(s: &str, max: usize) -> String {
 #[cfg(test)]
 mod cli_tests {
     use super::{
-        Args, ProcessMemory, footprint, scanner::SystemMemory, write_process_table,
-        write_system_memory,
+        Args, GroupDeep, ProcessDeep, ProcessMemory, footprint, group, measure_cli, scanner::SystemMemory,
+        write_process_table, write_system_memory,
     };
     use clap::{Parser, error::ErrorKind};
+    use std::collections::HashMap;
+
+    const MIB: u64 = 1024 * 1024;
+
+    fn measured(footprint: u64, compressed_or_swapped: u64) -> ProcessDeep {
+        ProcessDeep::Measured(footprint::Memory { footprint, compressed_or_swapped })
+    }
+
+    fn report(flags: &[&str], processes: Vec<ProcessMemory>, groups: &HashMap<Vec<i32>, GroupDeep>) -> String {
+        let args = Args::try_parse_from(["memo"].iter().chain(flags)).unwrap();
+        let mut out = Vec::new();
+        write_process_table(&mut out, &args, args.sort_column().unwrap(), processes, groups).unwrap();
+        String::from_utf8(out).unwrap()
+    }
+
+    fn row<'a>(report: &'a str, name: &str) -> Vec<&'a str> {
+        report.lines().find(|line| line.starts_with(name) || line.contains(&format!(" {name} ")))
+            .unwrap_or_else(|| panic!("no row {name} in {report}"))
+            .split_whitespace().collect()
+    }
 
     #[test]
     fn cli_keeps_process_counter_separate_from_disk_swap() {
         // footprint uses the "swapped" key for compressed pages even when disk swap is zero.
-        let counters = footprint::parse_compressed_or_swapped(r#"{
-            "processes": [{
-                "pid": 42, "name": "memo-fixture",
-                "categories": {
-                    "MALLOC": {"swapped": 2097152},
-                    "STACK": {"swapped": 1048576}
-                }
-            }]
+        let set = footprint::parse_set(r#"{
+            "unit": "byte", "bytes per unit": 1, "errors": [],
+            "total footprint": 11534336,
+            "summary": {"total": {"dirty": 11534336, "swapped": 3145728}},
+            "processes": [{"pid": 42, "name": "memo-fixture", "footprint": 11534336, "categories": {}}]
         }"#).unwrap();
-        let mib = 1024 * 1024;
-        let mut process = ProcessMemory::new(42, "memo-fixture".into(), 8 * mib);
-        process.compressed_or_swapped = counters[&42];
+        let mut process = ProcessMemory::new(42, "memo-fixture".into(), 8 * MIB);
+        process.deep = ProcessDeep::Measured(set.memory);
 
-        for args in [["memo", "--cli"], ["memo", "--ps"]] {
-            let args = Args::try_parse_from(args).unwrap();
-            for (swap_used, disk_label) in [(0, "0B"), (512 * mib, "512.0M")] {
+        for flags in [["--cli"], ["--ps"]] {
+            for (swap_used, disk_label) in [(0, "0B"), (512 * MIB, "512.0M")] {
                 let system = SystemMemory {
-                    total_bytes: 1024 * mib,
-                    used_bytes: 600 * mib,
-                    free_bytes: 424 * mib,
-                    swap_total: 1024 * mib,
+                    total_bytes: 1024 * MIB,
+                    used_bytes: 600 * MIB,
+                    free_bytes: 424 * MIB,
+                    swap_total: 1024 * MIB,
                     swap_used,
-                    compressed: 3 * mib,
+                    compressed: 3 * MIB,
                     wired: 0,
                     app_memory: 0,
                     cache: 0,
                 };
                 let mut out = Vec::new();
                 write_system_memory(&mut out, &system).unwrap();
-                write_process_table(&mut out, &args, args.sort_column().unwrap(), vec![process.clone()])
-                    .unwrap();
-                let report = String::from_utf8(out).unwrap();
-                assert!(report.contains(&format!("Disk swap: {disk_label} / 1.0G")));
-                assert!(report.contains("RSS          COMPRESSED OR SWAPPED TOTAL"));
-                let row = report.lines().find(|line| line.contains("memo-fixture")).unwrap();
-                let columns: Vec<_> = row.split_whitespace().collect();
-                assert!(columns.ends_with(&["8.0M", "3.0M", "11.0M"]));
-                assert!(!report.contains("unaccounted"));
-                assert!(!report.contains("(system:"));
+                let text = String::from_utf8(out).unwrap()
+                    + &report(&flags, vec![process.clone()], &HashMap::new());
+                assert!(text.contains(&format!("Disk swap: {disk_label} / 1.0G")));
+                assert!(text.contains("COMPRESSED OR SWAPPED FOOTPRINT"), "{text}");
+                assert!(row(&text, "memo-fixture").ends_with(&["8.0M", "3.0M", "11.0M"]), "{text}");
+                assert!(!text.contains("unaccounted"));
+                assert!(!text.contains("(system:"));
             }
         }
+    }
+
+    #[test]
+    fn grouped_rows_use_the_group_measurement_not_member_sums() {
+        // Two processes that each measure 42 MiB alone because they share a
+        // 32 MiB region. Apple's call over both returns 52 MiB.
+        let opera = |pid, name: &str| {
+            let mut p = ProcessMemory::new(pid, name.into(), 30 * MIB);
+            p.deep = measured(42 * MIB, 24 * MIB);
+            p
+        };
+        let mut daemon = ProcessMemory::new(3, "rootd".into(), 5 * MIB);
+        daemon.deep = ProcessDeep::Unavailable;
+        let mut helper = ProcessMemory::new(5, "Slack Helper".into(), 2 * MIB);
+        helper.deep = ProcessDeep::Unavailable;
+        let mut slack = ProcessMemory::new(4, "Slack".into(), 9 * MIB);
+        slack.deep = measured(20 * MIB, 0);
+        let processes = vec![opera(1, "Opera"), opera(2, "Opera Helper (Renderer)"), daemon, slack, helper];
+        let groups = HashMap::from([
+            (vec![1, 2], GroupDeep::Measured(footprint::Memory {
+                footprint: 52 * MIB, compressed_or_swapped: 28 * MIB })),
+            (vec![4, 5], GroupDeep::Partial {
+                memory: footprint::Memory { footprint: 20 * MIB, compressed_or_swapped: 0 },
+                measured: 1, members: 2 }),
+        ]);
+
+        let text = report(&["--cli"], processes.clone(), &groups);
+        assert!(row(&text, "Opera").ends_with(&["60.0M", "28.0M", "52.0M"]), "{text}");
+        assert!(row(&text, "Slack").ends_with(&["11.0M", "≥0B", "≥20.0M"]), "partial: {text}");
+        assert!(row(&text, "rootd").ends_with(&["5.0M", "n/a", "n/a"]), "unavailable, not zero: {text}");
+        let names: Vec<_> = text.lines().filter_map(|l| l.split_whitespace().next())
+            .filter(|n| ["Opera", "Slack", "rootd"].contains(n)).collect();
+        assert_eq!(names, ["Opera", "Slack", "rootd"], "footprint order, unreadable last");
+        assert!(text.contains("RSS SUM"), "{text}");
+        assert!(text.contains("footprint read 3 • unavailable 2"), "{text}");
+
+        // A multi-process row whose measurement is missing is not shown as a sum.
+        let text = report(&["--cli"], processes.clone(), &HashMap::new());
+        assert!(row(&text, "Opera").ends_with(&["60.0M", "n/a", "n/a"]), "{text}");
+
+        // Ungrouped rows show each process alone.
+        let text = report(&["--ps"], processes, &groups);
+        assert!(row(&text, "Opera").ends_with(&["30.0M", "24.0M", "42.0M"]), "{text}");
+        assert!(row(&text, "rootd").ends_with(&["5.0M", "n/a", "n/a"]), "{text}");
+    }
+
+    #[test]
+    fn cli_rows_keep_unreadable_members_and_take_coverage_from_the_group_call() {
+        // PID 3 has no RSS (sysinfo cannot read it) and footprint cannot read
+        // it alone. It still belongs to the Opera row and its group call.
+        let procs = || {
+            vec![
+                ProcessMemory::new(1, "Opera".into(), 30 * MIB),
+                ProcessMemory::new(2, "Opera Helper (Renderer)".into(), 30 * MIB),
+                ProcessMemory::new(3, "Opera Helper (GPU)".into(), 0),
+            ]
+        };
+        let run = |group_reads_3: bool| {
+            let calls = std::sync::Mutex::new(Vec::new());
+            let measure = |pids: &[i32]| -> anyhow::Result<footprint::SetMeasurement> {
+                calls.lock().unwrap().push(pids.to_vec());
+                let read: Vec<i32> = pids.iter().copied()
+                    .filter(|p| *p != 3 || (pids.len() > 1 && group_reads_3)).collect();
+                if read.is_empty() {
+                    anyhow::bail!("footprint exited 66");
+                }
+                let n = read.len() as u64;
+                Ok(footprint::SetMeasurement { pids: read, memory: footprint::Memory {
+                    footprint: (10 * n + 32) * MIB, compressed_or_swapped: 4 * n * MIB } })
+            };
+            let mut processes = procs();
+            let groups = measure_cli(&mut processes, Some(group::GroupMode::App), &measure);
+            let calls = calls.into_inner().unwrap();
+            assert!(calls.contains(&vec![1, 2, 3]), "the group call holds every member: {calls:?}");
+            (processes, groups)
+        };
+
+        // footprint reads only 1 and 2: the row is a lower bound, not complete.
+        let (processes, groups) = run(false);
+        assert_eq!(processes.len(), 3, "no observed PID is dropped");
+        assert_eq!(processes[2].deep, ProcessDeep::Unavailable);
+        let text = report(&["--cli"], processes.clone(), &groups);
+        assert!(row(&text, "Opera").starts_with(&["Opera", "3"]), "{text}");
+        assert!(row(&text, "Opera").ends_with(&["60.0M", "≥8.0M", "≥52.0M"]), "{text}");
+        assert!(text.contains("Rows: 0 complete • 1 lower bound (≥) • 0 n/a"), "{text}");
+        let ps = report(&["--ps"], processes, &groups);
+        assert!(row(&ps, "3").ends_with(&["0B", "n/a", "n/a"]), "{ps}");
+
+        // Unavailable alone, read in the group call: the row is complete.
+        let (processes, groups) = run(true);
+        let text = report(&["--cli"], processes, &groups);
+        assert!(row(&text, "Opera").ends_with(&["60.0M", "12.0M", "62.0M"]), "{text}");
+        assert!(text.contains("footprint read 2 • unavailable 1"), "{text}");
+        assert!(text.contains("Rows: 1 complete • 0 lower bound (≥) • 0 n/a"), "{text}");
     }
 
     #[test]
@@ -704,20 +865,20 @@ mod cli_tests {
         std::fs::create_dir(&fixture_path).unwrap();
         let project_fixture = ProjectFixture(fixture_path);
         let fixture = [
-            ("memo-alpha", 100, 0),
-            ("memo-beta", 60, 210),
-            ("memo-gamma", 90, 190),
+            ("memo-alpha", 100, 0, 100),
+            ("memo-beta", 60, 210, 270),
+            ("memo-gamma", 90, 190, 280),
         ];
         let processes: Vec<_> = fixture
             .into_iter()
             .enumerate()
-            .map(|(id, (name, rss, counter))| {
+            .map(|(id, (name, rss, counter, footprint))| {
                 let root = project_fixture.0.join(name);
                 std::fs::create_dir(&root).unwrap();
                 std::fs::write(root.join("package.json"), "{}").unwrap();
                 let mut process = ProcessMemory::new(id as i32 + 1, name.into(), rss);
                 process.cwd = root.to_str().unwrap().into();
-                process.compressed_or_swapped = counter;
+                process.deep = measured(footprint, counter);
                 process
             })
             .collect();
@@ -733,20 +894,21 @@ mod cli_tests {
                 String::new()
             };
             for (flags, expected, header) in [
-                (&[][..], total, "TOTAL"),
-                (&["--sort", "total"], total, "TOTAL"),
-                (&["--sort", "rss"], rss, "TOTAL"),
-                (&["--sort", "swap"], counter, "TOTAL"),
-                (&["--sort", "name"], name, "TOTAL"),
-                (&["--quick"], rss, "RSS"),
-                (&["--quick", "--sort", "rss"], rss, "RSS"),
-                (&["--quick", "--sort", "name"], name, "RSS"),
+                (&[][..], total, "FOOTPRINT"),
+                (&["--sort", "total"], total, "FOOTPRINT"),
+                (&["--sort", "footprint"], total, "FOOTPRINT"),
+                (&["--sort", "rss"], rss, "FOOTPRINT"),
+                (&["--sort", "swap"], counter, "FOOTPRINT"),
+                (&["--sort", "name"], name, "FOOTPRINT"),
+                (&["--quick"], rss, "RSS SUM"),
+                (&["--quick", "--sort", "rss"], rss, "RSS SUM"),
+                (&["--quick", "--sort", "name"], name, "RSS SUM"),
             ] {
                 let args = Args::try_parse_from(
                     ["memo", "--cli", "--group", group].into_iter().chain(flags.iter().copied()),
                 ).unwrap();
                 let mut out = Vec::new();
-                write_process_table(&mut out, &args, args.sort_column().unwrap(), processes.clone())
+                write_process_table(&mut out, &args, args.sort_column().unwrap(), processes.clone(), &HashMap::new())
                     .unwrap();
                 let report = String::from_utf8(out).unwrap();
                 let columns = report.lines().next().unwrap();

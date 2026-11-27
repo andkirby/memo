@@ -1,5 +1,7 @@
+use crate::deep::{GroupDeep, GroupKey, ProcessDeep};
 use crate::group::{AppGroup, GroupMode};
 use crate::scanner::{ProcessMemory, SystemMemory};
+use std::collections::HashMap;
 use crate::termination::ProcessIdentity;
 use ratatui::layout::Rect;
 use ratatui::widgets::TableState;
@@ -36,28 +38,47 @@ impl RowMap { pub fn new() -> Self { Self::default() } }
 
 // ─── Sort ───────────────────────────────────────────────────────────────────
 
+/// `Physical` sorts by RSS. `Footprint` (CLI `--sort total`) and
+/// `CompressedOrSwapped` sort by Apple footprint values; rows without a value
+/// (pending or unavailable) come last in either direction. Partial groups
+/// sort by their lower bound.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum SortColumn { Name, Physical, CompressedOrSwapped, Total }
+pub enum SortColumn { Name, Physical, CompressedOrSwapped, Footprint }
+
+fn directed(order: Ordering, descending: bool) -> Ordering {
+    if descending { order.reverse() } else { order }
+}
+
+fn known_first(a: Option<u64>, b: Option<u64>, descending: bool) -> Ordering {
+    match (a, b) {
+        (Some(a), Some(b)) => directed(a.cmp(&b), descending),
+        (Some(_), None) => Ordering::Less,
+        (None, Some(_)) => Ordering::Greater,
+        (None, None) => Ordering::Equal,
+    }
+}
 
 impl SortColumn {
     pub fn compare_groups(self, a: &AppGroup, b: &AppGroup, descending: bool) -> Ordering {
-        let order = match self {
-            Self::Name => a.name.cmp(&b.name),
-            Self::Physical => a.total_rss.cmp(&b.total_rss),
-            Self::CompressedOrSwapped => a.total_compressed_or_swapped.cmp(&b.total_compressed_or_swapped),
-            Self::Total => a.total().cmp(&b.total()),
-        };
-        if descending { order.reverse() } else { order }
+        match self {
+            Self::Name => directed(a.name.cmp(&b.name), descending),
+            Self::Physical => directed(a.total_rss.cmp(&b.total_rss), descending),
+            Self::CompressedOrSwapped => known_first(a.compressed_or_swapped(), b.compressed_or_swapped(), descending),
+            Self::Footprint => known_first(a.footprint(), b.footprint(), descending),
+        }
+        // Equal or missing values (e.g. before the deep scan ends) keep RSS order.
+        .then_with(|| b.total_rss.cmp(&a.total_rss))
+        .then_with(|| a.name.cmp(&b.name))
     }
 
     pub fn compare_processes(self, a: &ProcessMemory, b: &ProcessMemory, descending: bool) -> Ordering {
-        let order = match self {
-            Self::Name => a.name.cmp(&b.name),
-            Self::Physical => a.rss.cmp(&b.rss),
-            Self::CompressedOrSwapped => a.compressed_or_swapped.cmp(&b.compressed_or_swapped),
-            Self::Total => a.total().cmp(&b.total()),
-        };
-        if descending { order.reverse() } else { order }
+        match self {
+            Self::Name => directed(a.name.cmp(&b.name), descending),
+            Self::Physical => directed(a.rss.cmp(&b.rss), descending),
+            Self::CompressedOrSwapped => known_first(a.compressed_or_swapped(), b.compressed_or_swapped(), descending),
+            Self::Footprint => known_first(a.footprint(), b.footprint(), descending),
+        }
+        .then_with(|| b.rss.cmp(&a.rss))
     }
 }
 
@@ -77,9 +98,9 @@ pub struct ProcessDetail {
     pub status: String,
     pub start_time: u64,
     pub cpu_usage: f32,
-    // Memory — read directly from app.all_processes, not re-fetched
+    // Memory — from the scan, not re-fetched. `deep` follows later results.
     pub rss: u64,
-    pub compressed_or_swapped: u64,
+    pub deep: ProcessDeep,
     pub parent_pid: Option<i32>,
     pub parent_cmd: Option<String>,
 }
@@ -114,8 +135,14 @@ pub struct App {
     pub sort_desc: bool,
     pub last_click: Option<(u16, u16, Instant, usize)>,
     pub is_loading: bool,
-    pub scan_progress: Option<(usize, usize)>,
-    pub deep_scan_progress: Option<(usize, usize)>,
+    /// Identifies the current scan; events from older scans are ignored.
+    pub scan_id: u64,
+    /// Footprint calls finished / planned in the current phase.
+    pub deep_scan_progress: Option<DeepProgress>,
+    /// Group measurements of the current scan, by PID set.
+    pub group_measurements: HashMap<GroupKey, GroupDeep>,
+    /// True once every planned footprint call of the scan has finished.
+    pub deep_settled: bool,
     pub status_message: Option<String>,
     pub pending_termination: Option<TerminationTarget>,
     pub termination_status: Option<String>,
@@ -123,9 +150,19 @@ pub struct App {
     pub current_detail: Option<ProcessDetail>,
     pub popup_area: Option<Rect>,   // Some while the detail popup is on screen
     pub spinner_idx: usize,
+    /// Sum of RSS over all processes; shared pages count once per process.
     pub total_phys: u64,
-    pub total_compressed_or_swapped: u64,
 }
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DeepProgress {
+    pub phase: DeepPhase,
+    pub done: usize,
+    pub total: usize,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DeepPhase { Processes, Groups }
 
 impl App {
     pub fn new() -> Self {
@@ -141,12 +178,14 @@ impl App {
             selected_key: None,
             row_map: RowMap::new(),
             table_area: Rect::default(),
-            sort_column: SortColumn::Total,
+            sort_column: SortColumn::Footprint,
             sort_desc: true,
             last_click: None,
             is_loading: false,
-            scan_progress: None,
+            scan_id: 0,
             deep_scan_progress: None,
+            group_measurements: HashMap::new(),
+            deep_settled: false,
             status_message: None,
             pending_termination: None,
             termination_status: None,
@@ -155,7 +194,6 @@ impl App {
             popup_area: None,
             spinner_idx: 0,
             total_phys: 0,
-            total_compressed_or_swapped: 0,
         }
     }
 
@@ -298,9 +336,74 @@ fn sort_children(procs: &mut [ProcessMemory], col: &SortColumn, desc: bool) {
 
     pub fn recalculate_from(&mut self, processes: &[ProcessMemory]) {
         self.total_phys = processes.iter().map(|p| p.rss).sum();
-        self.total_compressed_or_swapped = processes.iter().map(|p| p.compressed_or_swapped).sum();
         self.groups = crate::group::group_processes(processes, self.group_mode);
+        self.resolve_group_deep();
         self.sort_groups();
+    }
+
+    fn resolve_group_deep(&mut self) {
+        for g in &mut self.groups {
+            g.resolve_deep(&self.group_measurements, self.deep_settled);
+        }
+    }
+
+    // ─── Scan lifecycle ────────────────────────────────────────────────
+
+    /// Reset scan state and return the new scan's id.
+    pub fn start_scan(&mut self) -> u64 {
+        self.scan_id += 1;
+        self.is_loading = true;
+        self.termination_status = None;
+        self.groups.clear();
+        self.all_processes.clear();
+        self.expanded_group = None;
+        self.group_measurements.clear();
+        self.deep_settled = false;
+        self.deep_scan_progress = None;
+        self.scan_id
+    }
+
+    /// Apply per-process measurements in place. Membership does not change,
+    /// so groups are not rebuilt; one-process groups pick up their value.
+    pub fn apply_process_deep(&mut self, results: &[(i32, ProcessDeep)]) {
+        let results: HashMap<i32, ProcessDeep> = results.iter().copied().collect();
+        let update = |p: &mut ProcessMemory| {
+            if let Some(deep) = results.get(&p.pid) {
+                p.deep = *deep;
+            }
+        };
+        self.all_processes.iter_mut().for_each(update);
+        for g in &mut self.groups {
+            g.processes.iter_mut().for_each(update);
+        }
+        if let Some(detail) = &mut self.current_detail
+            && let Some(deep) = results.get(&detail.pid)
+        {
+            detail.deep = *deep;
+        }
+        self.resolve_group_deep();
+        self.sort_groups();
+    }
+
+    pub fn apply_group_deep(&mut self, key: GroupKey, deep: GroupDeep) {
+        self.group_measurements.insert(key, deep);
+        self.resolve_group_deep();
+        self.sort_groups();
+    }
+
+    pub fn finish_deep_scan(&mut self) {
+        self.deep_settled = true;
+        self.deep_scan_progress = None;
+        self.resolve_group_deep();
+        self.sort_groups();
+    }
+
+    /// Processes with a footprint value, and processes footprint could not read.
+    pub fn deep_coverage(&self) -> (usize, usize) {
+        let measured = self.all_processes.iter().filter(|p| p.deep.memory().is_some()).count();
+        let unavailable = self.all_processes.iter()
+            .filter(|p| p.deep == ProcessDeep::Unavailable).count();
+        (measured, unavailable)
     }
 
     // ─── Health ─────────────────────────────────────────────────────────
@@ -514,24 +617,77 @@ mod tests {
 
     // ─── Sorting ────────────────────────────────────────────────────
 
-    fn pm(pid: i32, name: &str, rss: u64, compressed_or_swapped: u64) -> ProcessMemory {
+    fn pm(pid: i32, name: &str, rss: u64, footprint: u64) -> ProcessMemory {
         let mut p = ProcessMemory::new(pid, name.to_string(), rss);
-        p.compressed_or_swapped = compressed_or_swapped;
+        p.deep = ProcessDeep::Measured(crate::footprint::Memory {
+            footprint,
+            compressed_or_swapped: footprint / 2,
+        });
         p
     }
 
     #[test]
     fn children_follow_active_sort_with_pid_tiebreak() {
         let mut procs = vec![
-            pm(1, "node", 100, 0),   // total 100
-            pm(3, "node", 50, 200),  // total 250
-            pm(2, "node", 50, 200),  // total 250 — pid tie-break
+            pm(1, "node", 100, 100),
+            pm(3, "node", 50, 250),
+            pm(2, "node", 50, 250),  // footprint tie — pid tie-break
         ];
-        App::sort_children(&mut procs, &SortColumn::Total, true);
+        App::sort_children(&mut procs, &SortColumn::Footprint, true);
         assert_eq!([procs[0].pid, procs[1].pid, procs[2].pid], [2, 3, 1]);
         // Ascending direction flips the key but keeps the pid tie-break ascending.
-        App::sort_children(&mut procs, &SortColumn::Total, false);
+        App::sort_children(&mut procs, &SortColumn::Footprint, false);
         assert_eq!([procs[0].pid, procs[1].pid, procs[2].pid], [1, 2, 3]);
+    }
+
+    #[test]
+    fn rows_without_a_value_sort_last_in_both_directions() {
+        let mut unread = pm(4, "root-daemon", 900, 0);
+        unread.deep = ProcessDeep::Unavailable;
+        let mut pending = pm(5, "new", 800, 0);
+        pending.deep = ProcessDeep::Pending;
+        let mut procs = vec![unread, pm(1, "a", 1, 10), pending, pm(2, "b", 1, 0)];
+        for desc in [true, false] {
+            for col in [SortColumn::Footprint, SortColumn::CompressedOrSwapped] {
+                App::sort_children(&mut procs, &col, desc);
+                let pids: Vec<_> = procs.iter().map(|p| p.pid).collect();
+                let measured = if desc { [1, 2] } else { [2, 1] };
+                assert_eq!(pids[..2], measured, "{col:?} desc={desc}: a real zero is a value");
+                assert_eq!(pids[2..], [4, 5], "{col:?} desc={desc}");
+            }
+        }
+    }
+
+    #[test]
+    fn scan_results_update_groups_without_mixing_scans() {
+        use crate::footprint::Memory;
+        let mut app = App::new();
+        app.group_mode = GroupMode::App;
+        let scan = app.start_scan();
+        let mut a = ProcessMemory::new(1, "Opera".into(), 100);
+        a.deep = ProcessDeep::Pending;
+        app.set_processes(vec![a, ProcessMemory::new(2, "Opera Helper".into(), 100),
+            ProcessMemory::new(3, "Slack".into(), 10)]);
+        let m = |footprint| Memory { footprint, compressed_or_swapped: 1 };
+        app.apply_process_deep(&[(1, ProcessDeep::Measured(m(40))), (2, ProcessDeep::Measured(m(40))),
+            (3, ProcessDeep::Unavailable)]);
+        let opera = |app: &App| app.groups.iter().find(|g| g.name == "Opera").unwrap().deep;
+        assert_eq!(opera(&app), GroupDeep::Pending, "member values are not added up");
+        assert_eq!(app.groups.iter().find(|g| g.name == "Slack").unwrap().deep, GroupDeep::Unavailable);
+
+        app.apply_group_deep(vec![1, 2], GroupDeep::Measured(m(50)));
+        assert_eq!(opera(&app), GroupDeep::Measured(m(50)));
+        assert_eq!(app.groups[0].name, "Opera", "sorted by footprint");
+
+        // Tab regroups from scanned data and keeps the measurement.
+        app.cycle_group();
+        app.cycle_group();
+        assert_eq!(opera(&app), GroupDeep::Measured(m(50)));
+        assert_eq!(app.deep_coverage(), (2, 1));
+
+        let next = app.start_scan();
+        assert!(next > scan);
+        assert!(app.group_measurements.is_empty() && !app.deep_settled);
     }
 
     #[test]

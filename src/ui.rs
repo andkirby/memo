@@ -1,4 +1,5 @@
-use crate::app::{App, SortColumn, TerminationTarget};
+use crate::app::{App, DeepPhase, SortColumn, TerminationTarget};
+use crate::deep::{self, Metric, ProcessDeep};
 use crate::group::GroupMode;
 use crate::scanner::format_size;
 use ratatui::{
@@ -172,14 +173,18 @@ fn render_overview(f: &mut Frame, app: &mut App, area: Rect) {
             Span::styled(health, Style::default().fg(health_color).add_modifier(Modifier::BOLD)),
             Span::raw("  "),
             Span::styled(
-                format!("{} {} · {} procs · {} RSS · {} compressed or swapped{}",
-                    app.groups.len(),
-                    noun,
-                    app.all_processes.len(),
-                    format_size(app.total_phys),
-                    format_size(app.total_compressed_or_swapped),
-                    warning,
-                ),
+                {
+                    let (measured, unavailable) = app.deep_coverage();
+                    format!("{} {} · {} procs · {} RSS sum · footprint read {} · n/a {}{}",
+                        app.groups.len(),
+                        noun,
+                        app.all_processes.len(),
+                        format_size(app.total_phys),
+                        measured,
+                        unavailable,
+                        warning,
+                    )
+                },
                 Style::default().fg(Color::Rgb(130, 130, 140)),
             ),
         ]);
@@ -212,9 +217,9 @@ fn render_process_table(f: &mut Frame, app: &mut App, area: Rect) {
         format!("{}{}", name_header, arrow(SortColumn::Name)),
         "PROCS".to_string(),
         bridge_header.to_string(),
-        format!("RSS{}", arrow(SortColumn::Physical)),
+        format!("ΣRSS{}", arrow(SortColumn::Physical)),
         format!("CMP/SWP{}", arrow(SortColumn::CompressedOrSwapped)),
-        format!("TOTAL{}", arrow(SortColumn::Total)),
+        format!("FOOTPRINT{}", arrow(SortColumn::Footprint)),
     ];
     let header_cells = header_row.iter().enumerate().map(|(i, h)| {
         if i == 2 { Cell::from(h.as_str()).style(header_style) }  // bridge column stays left-aligned
@@ -251,8 +256,9 @@ fn render_process_table(f: &mut Frame, app: &mut App, area: Rect) {
             right(group.processes.len().to_string(), Style::default()),
             Cell::from(bridge_cell).style(Style::default().fg(Color::DarkGray)),
             right(format_size(group.total_rss), Style::default().fg(Color::Green)),
-            right(format_size(group.total_compressed_or_swapped), compressed_or_swapped_color(group.total_compressed_or_swapped)),
-            right(format_size(group.total()), total_color(group.total())),
+            right(deep::group_cell(group.deep, Metric::CompressedOrSwapped),
+                compressed_or_swapped_color(group.compressed_or_swapped())),
+            right(deep::group_cell(group.deep, Metric::Footprint), total_color(group.footprint())),
         ]).height(1);
 
         rows.push(row);
@@ -279,8 +285,9 @@ fn render_process_table(f: &mut Frame, app: &mut App, area: Rect) {
                     Cell::from(""),
                     Cell::from(short_cmd(&proc.cmdline, bridge_width)).style(Style::default().fg(Color::DarkGray)),
                     right(format_size(proc.rss), Style::default().fg(Color::Green)),
-                    right(format_size(proc.compressed_or_swapped), compressed_or_swapped_color(proc.compressed_or_swapped)),
-                    right(format_size(proc.total()), total_color(proc.total())),
+                    right(deep::process_cell(proc.deep, Metric::CompressedOrSwapped),
+                        compressed_or_swapped_color(proc.compressed_or_swapped())),
+                    right(deep::process_cell(proc.deep, Metric::Footprint), total_color(proc.footprint())),
                 ]).height(1);
                 rows.push(child_row);
                 row_map.push((group.name.clone(), Some(proc.pid)));  // sub-process row
@@ -396,7 +403,10 @@ fn fit_bridge_tokens(tokens: &[(String, usize)], width: usize) -> String {
     "…".to_string()
 }
 
-fn compressed_or_swapped_color(bytes: u64) -> Style {
+fn compressed_or_swapped_color(bytes: Option<u64>) -> Style {
+    let Some(bytes) = bytes else {
+        return Style::default().fg(Color::DarkGray);  // pending or unavailable
+    };
     if bytes == 0 {
         Style::default().fg(Color::DarkGray)  // Zero is neutral.
     } else if bytes > 1024 * 1024 * 1024 {
@@ -408,9 +418,12 @@ fn compressed_or_swapped_color(bytes: u64) -> Style {
     }
 }
 
-/// Color for the displayed total — warm gradient from cool to hot
+/// Color for the footprint — warm gradient from cool to hot
 /// < 500M → teal, 500M-1G → green, 1-2G → yellow, 2-4G → orange, > 4G → red
-fn total_color(bytes: u64) -> Style {
+fn total_color(bytes: Option<u64>) -> Style {
+    let Some(bytes) = bytes else {
+        return Style::default().fg(Color::DarkGray);  // pending or unavailable
+    };
     let gb = bytes as f64 / (1024.0 * 1024.0 * 1024.0);
     if gb >= 4.0 {
         Style::default().fg(Color::Rgb(220, 60, 60))      // red
@@ -468,14 +481,19 @@ fn render_status(f: &mut Frame, app: &mut App, area: Rect) {
             .style(Style::default().fg(Color::Yellow))
             .block(Block::default().borders(Borders::ALL).title("Status"));
         f.render_widget(status, chunks[1]);
-    } else if let Some((current, total)) = app.deep_scan_progress {
+    } else if let Some(progress) = app.deep_scan_progress {
+        let (current, total) = (progress.done, progress.total);
         let pct = if total > 0 { ((current as f64 / total as f64) * 100.0) as u16 } else { 0 };
         let spinner = SPINNER[app.spinner_idx % SPINNER.len()];
+        let what = match progress.phase {
+            DeepPhase::Processes => "processes",
+            DeepPhase::Groups => "groups",
+        };
         let gauge = Gauge::default()
-            .block(Block::default().borders(Borders::ALL).title("Deep Analysis"))
+            .block(Block::default().borders(Borders::ALL).title("Deep Analysis (footprint)"))
             .gauge_style(Style::default().fg(Color::Cyan))
             .percent(pct.min(100))
-            .label(format!("{} Scanning {}/{} ({}%)", spinner, current, total, pct));
+            .label(format!("{} Measuring {} {}/{} ({}%)", spinner, what, current, total, pct));
         f.render_widget(gauge, chunks[1]);
     } else if app.is_loading {
         let spinner = SPINNER[app.spinner_idx % SPINNER.len()];
@@ -603,22 +621,32 @@ fn render_detail_popup(f: &mut Frame, app: &mut App) {
         f.render_widget(Paragraph::new(parent_text), chunks[2]);
 
         // Memory values come from the same scan as the table row.
+        let deep_value = |metric| match details.deep {
+            ProcessDeep::Pending => "measuring…".to_string(),
+            ProcessDeep::Unavailable => "unavailable (footprint could not read it)".to_string(),
+            ProcessDeep::Measured(_) => deep::process_cell(details.deep, metric),
+        };
         let mem_text = vec![
-            Line::from(Span::styled("── Memory ──", Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD))),
+            Line::from(Span::styled("── Memory (this process alone) ──", Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD))),
             Line::from(vec![
                 Span::raw("RSS (resident):        "),
                 Span::styled(format_size(details.rss), Style::default().fg(Color::Green)),
             ]),
             Line::from(vec![
-                Span::raw("Compressed or swapped: "),
-                Span::styled(format_size(details.compressed_or_swapped), Style::default().fg(Color::Red)),
+                Span::raw("Footprint:             "),
+                Span::styled(deep_value(Metric::Footprint), Style::default().fg(Color::Magenta)),
             ]),
             Line::from(vec![
-                Span::raw("Total:                 "),
-                Span::styled(format_size(details.rss.saturating_add(details.compressed_or_swapped)), Style::default().fg(Color::Magenta)),
+                Span::raw("Compressed or swapped: "),
+                Span::styled(deep_value(Metric::CompressedOrSwapped), Style::default().fg(Color::Red)),
             ]),
+            Line::from(Span::styled(
+                "Footprint includes memory shared with other processes. A group row counts it once, \
+                 so it can be less than the sum of its processes.",
+                Style::default().fg(Color::DarkGray),
+            )),
         ];
-        f.render_widget(Paragraph::new(mem_text), chunks[3]);
+        f.render_widget(Paragraph::new(mem_text).wrap(Wrap { trim: true }), chunks[3]);
     } else {
         let spinner = SPINNER[app.spinner_idx % SPINNER.len()];
         let p = Paragraph::new(format!("{} Fetching details...", spinner))
@@ -650,6 +678,7 @@ fn centered_rect(percent_x: u16, percent_y: u16, r: Rect) -> Rect {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::deep::GroupDeep;
     use crate::group::GroupKind;
     use crate::scanner::ProcessMemory;
     use ratatui::{backend::TestBackend, Terminal};
@@ -722,7 +751,7 @@ mod tests {
             kind: GroupKind::Project,
             processes: vec![p(1, "node", 100), p(2, "bun", 50), p(3, "workerd", 25)],
             total_rss: 175,
-            total_compressed_or_swapped: 0,
+            deep: GroupDeep::Pending,
             thread_count: 3,
         }
     }
@@ -801,10 +830,36 @@ mod tests {
         let header: String = (0..buf.area.width)
             .map(|x| buf[(x, 1)].symbol().to_string()) // y=1 is the header row
             .collect();
-        assert!(header.contains("TOTAL ↓"), "default sort is total desc: {}", header);
+        assert!(header.contains("FOOTPRINT ↓"), "default sort is footprint desc: {}", header);
         assert!(header.contains("CMP/SWP"), "{}", header);
+        assert!(header.contains("ΣRSS"), "group RSS is a sum: {}", header);
         assert!(!header.contains("PROJECT ↓"), "{}", header);
         assert!(!header.contains("RSS ↓"), "{}", header);
+    }
+
+    #[test]
+    fn rendered_rows_distinguish_pending_unavailable_partial_and_zero() {
+        use crate::footprint::Memory;
+        let mib = 1024 * 1024;
+        let mut group = bridge_group();
+        group.processes[0].deep = ProcessDeep::Measured(Memory { footprint: 0, compressed_or_swapped: 0 });
+        group.processes[1].deep = ProcessDeep::Unavailable;
+        group.processes[2].deep = ProcessDeep::Pending;
+        group.deep = GroupDeep::Partial {
+            memory: Memory { footprint: 52 * mib, compressed_or_swapped: 28 * mib },
+            measured: 1, members: 3,
+        };
+        let mut app = App::new();
+        app.groups = vec![group];
+        app.expanded_group = Some("~/demo".into());
+        let mut terminal = Terminal::new(TestBackend::new(120, 24)).unwrap();
+        terminal.draw(|f| render_process_table(f, &mut app, f.area())).unwrap();
+        let buf = terminal.backend().buffer();
+        let line = |y| (0..buf.area.width).map(|x| buf[(x, y)].symbol().to_string()).collect::<String>();
+        assert!(line(3).contains("≥28.0M") && line(3).contains("≥52.0M"), "partial group: {}", line(3));
+        assert!(line(4).contains("0B"), "real zero: {}", line(4));
+        assert!(line(5).contains("n/a"), "unavailable: {}", line(5));
+        assert!(line(6).contains("…"), "pending: {}", line(6));
     }
 
     #[test]
@@ -921,7 +976,7 @@ mod tests {
                 kind: crate::group::GroupKind::App,
                 processes: procs,
                 total_rss: 100,
-                total_compressed_or_swapped: 0,
+                deep: GroupDeep::Pending,
                 thread_count: 1,
             }];
             let mut terminal = Terminal::new(TestBackend::new(100, 24)).unwrap();
